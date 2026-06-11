@@ -1,2 +1,2 @@
 # spectral-tracker
-Spectral tracker for live neutron data assimilation
+Spectral tracker for real-time neutron data assimilation
