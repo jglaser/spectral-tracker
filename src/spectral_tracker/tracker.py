@@ -365,7 +365,7 @@ def _tracker_loop_reference(
  
     return tracking_history
 
-def run_spectral_holonomic_tracker(
+def tracker(
     finder_file: str,
     event_batches,
     structure_factors: gemmi.Mtz = None,

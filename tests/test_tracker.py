@@ -9,8 +9,10 @@ import scipy.spatial.transform
 import jax
 import jax.numpy as jnp
 
-from subhkl.commands import run_spectral_holonomic_tracker, _sample_to_lab_matrix
 from subhkl.instrument.goniometer import lab_to_sample
+
+from spectral_tracker import tracker
+from spectral_tracker.tracker import _sample_to_lab_matrix
 
 import pytest
 import e3x
@@ -213,7 +215,7 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -247,7 +249,7 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -282,7 +284,7 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -321,7 +323,7 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -381,7 +383,7 @@ class TestBinghamTracker(unittest.TestCase):
             recorded_errors.append((time, err))
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}°")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -432,7 +434,7 @@ class TestBinghamTracker(unittest.TestCase):
             
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -483,7 +485,7 @@ class TestBinghamTracker(unittest.TestCase):
             recorded_errors.append(err)
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Eigengap={metrics['eigengap']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -598,7 +600,7 @@ class TestBinghamTracker(unittest.TestCase):
             print(f"  -> [t={time:4.2f}s | {neutron_count:7d} evts] "
                   f"Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             structure_factors=mock_mtz,
@@ -699,7 +701,7 @@ class TestBinghamTracker(unittest.TestCase):
                 fh["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
                 fh["sample/U"] = U_seed
 
-            final_U = run_spectral_holonomic_tracker(
+            final_U = tracker(
                 finder_file=self.finder_file,
                 event_batches=event_stream,
                 structure_factors=mock_mtz,
@@ -862,7 +864,7 @@ class TestBinghamTracker(unittest.TestCase):
             f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
             f["sample/U"] = U_seed
      
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=self.finder_file,
             event_batches=emit(),
             structure_factors=mock_mtz,
@@ -925,7 +927,7 @@ class TestTrackerInitialization:
         ]
 
         # Execute tracking graph up to the end of the entry sequence
-        final_U = run_spectral_holonomic_tracker(
+        final_U = tracker(
             finder_file=h5_file,
             event_batches=mock_batch,
             L_max=8,
