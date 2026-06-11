@@ -5,12 +5,24 @@ description = "Real-time neutron data assimilation"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "e3x",
     "jax>=0.9.1",
     "subhkl",
 ]
 
 [tool.uv.sources]
 subhkl = { git = "https://github.com/neutrons/subhkl.git" }
+
+# JAX with CUDA 12 support (NVIDIA GPUs)
+[project.optional-dependencies]
+cuda12 = [
+  "jax[cuda12]",
+]
+
+# JAX with ROCm support (AMD GPUs)
+rocm = [
+  "jax[rocm]",
+]
 
 [dependency-groups]
 dev = [
