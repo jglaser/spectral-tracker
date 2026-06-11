@@ -14,5 +14,5 @@ subhkl = { git = "https://github.com/neutrons/subhkl.git" }
 
 [dependency-groups]
 dev = [
-    pytest
+    "pytest",
 ]
