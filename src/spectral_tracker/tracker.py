@@ -365,11 +365,57 @@ def _tracker_loop_reference(
  
     return tracking_history
 
+def build_band_weights(q_mags, wl_min, wl_max, L_max, spectrum=None, n_quad=4096):
+    """
+    Ewald band weights w_l_j of shape (L_max+1, M).
+
+    spectrum=None  -> EXACT original analytic flat (top-hat) weights (no change).
+    spectrum=phi   -> weighted Legendre quadrature with assumed shape phi(lambda).
+    """
+    q = np.asarray(q_mags, dtype=float)
+    # Per-reflection x-interval the band covers. x = -0.5*|q|*lambda, so the
+    # short-wavelength edge (wl_min) is the LEAST negative x (x_max), and the
+    # long-wavelength edge (wl_max) is the MOST negative (x_min). Clip to [-1, 1].
+    x_max = np.clip(-0.5 * q * wl_min, -1.0, 1.0)
+    x_min = np.clip(-0.5 * q * wl_max, -1.0, 1.0)
+
+    if spectrum is None:
+        # ---- exact analytic flat top-hat (preserves the tracker's convention) ----
+        P_min = [np.ones_like(q), x_min]
+        P_max = [np.ones_like(q), x_max]
+        for l in range(1, L_max + 1):
+            P_min.append(((2 * l + 1) * x_min * P_min[-1] - l * P_min[-2]) / (l + 1))
+            P_max.append(((2 * l + 1) * x_max * P_max[-1] - l * P_max[-2]) / (l + 1))
+        w = [0.5 * (x_max - x_min)]
+        for l in range(1, L_max + 1):
+            w.append(0.5 * (P_max[l + 1] - P_max[l - 1] - (P_min[l + 1] - P_min[l - 1])))
+        return jnp.array(np.stack(w, axis=0))
+
+    # ---- weighted quadrature for an arbitrary assumed spectrum ----
+    u = (np.arange(n_quad) + 0.5) / n_quad                       # midpoints in (0,1)
+    x = x_min[:, None] + (x_max - x_min)[:, None] * u[None, :]    # (M, n_quad)
+    dx = ((x_max - x_min) / n_quad)[:, None]                      # (M, 1) >= 0
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lam = np.where(q[:, None] > 0, -2.0 * x / q[:, None], 0.0)  # wavelength at each node
+    phi = np.asarray(spectrum(lam), dtype=float)
+    phi = np.where(np.isfinite(phi), phi, 0.0)
+
+    P = [np.ones_like(x), x]
+    for l in range(1, L_max + 1):
+        P.append(((2 * l + 1) * x * P[-1] - l * P[-2]) / (l + 1))
+
+    w = []
+    for l in range(L_max + 1):
+        w.append(0.5 * (2 * l + 1) * np.sum(phi * P[l] * dx, axis=1))
+    return jnp.array(np.stack(w, axis=0))
+
 def tracker(
     finder_file: str,
     event_batches,
     structure_factors: gemmi.Mtz = None,
     instrument_name: str | None = None,
+    assumed_spectrum = None,
     streaming_callback=None,
     process_q_scale_start: float = 1e-3,
     process_q_scale_end: float = 1e-7,
@@ -477,19 +523,10 @@ def tracker(
 
     I_weights_jax = jax.device_put(I_weights)
 
-    x_max = np.clip(-0.5 * q_mags_np[res_mask] * wl_min_tracking, -1.0, 1.0)
-    x_min = np.clip(-0.5 * q_mags_np[res_mask] * wl_max_tracking, -1.0, 1.0)
-    P_min = [np.ones(M_peaks), x_min]
-    P_max = [np.ones(M_peaks), x_max]
-
-    for l_idx in range(1, L_max + 1):
-        P_min.append(((2 * l_idx + 1) * x_min * P_min[-1] - l_idx * P_min[-2]) / (l_idx + 1))
-        P_max.append(((2 * l_idx + 1) * x_max * P_max[-1] - l_idx * P_max[-2]) / (l_idx + 1))
-
-    w_l_j_list = [0.5 * (x_max - x_min)]
-    for l_idx in range(1, L_max + 1):
-        w_l_j_list.append(0.5 * (P_max[l_idx+1] - P_max[l_idx-1] - (P_min[l_idx+1] - P_min[l_idx-1])))
-    w_l_j = jnp.array(np.stack(w_l_j_list, axis=0))
+    w_l_j = build_band_weights(
+       q_mags_np[res_mask], wl_min_tracking, wl_max_tracking, L_max,
+       spectrum=assumed_spectrum,
+    )
 
     if U_init is not None:
         U_curr = jnp.array(U_init)
