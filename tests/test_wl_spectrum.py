@@ -241,7 +241,7 @@ class TestAssumedSpectrumShape(unittest.TestCase):
                 L_max=8,
                 d_min=D_MIN, d_max=D_MAX,
                 wl_min_tracking=WL_MIN, wl_max_tracking=WL_MAX,
-                #assumed_spectrum=assumed_spectrum,
+                assumed_spectrum=assumed_spectrum,
             )
             return self._evaluate_cubic_symmetric_error(U_true, final_U)
 

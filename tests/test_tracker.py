@@ -49,7 +49,7 @@ def get_cubic_symmetries():
                 syms.append(M)
     return syms
 
-class TestBinghamTracker(unittest.TestCase):
+class TestSpectralTracker(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
         self.finder_file = os.path.join(self.test_dir.name, "mock_finder.h5")
