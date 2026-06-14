@@ -250,6 +250,7 @@ def _tracker_loop_reference(
     gonio_axes=None, gonio_offsets=None,
     L_cov: int = 3, cov_ema_weight=0.1, cov_threshold_frac=0.3, cov_warmup_events=20000, sigmoid_k=12,
     q_scale_floor: float = 1e-5,
+    cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
 ):
     import h5py
  
@@ -338,7 +339,8 @@ def _tracker_loop_reference(
             meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
             current_q_scale,
             R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
-            sigmoid_k
+            sigmoid_k,
+            cos_gate, gate_temp, low_l_damp,
         )
  
         U_curr.block_until_ready()
@@ -365,17 +367,15 @@ def _tracker_loop_reference(
  
     return tracking_history
 
-def build_band_weights(q_mags, wl_min, wl_max, L_max, spectrum=None, n_quad=4096):
+def build_band_weights(q_mags, wl_min, wl_max, L_max, spectrum=None, lorentz=True, n_quad=4096):
     """
     Ewald band weights w_l_j of shape (L_max+1, M).
 
-    spectrum=None  -> EXACT original analytic flat (top-hat) weights (no change).
-    spectrum=phi   -> weighted Legendre quadrature with assumed shape phi(lambda).
+    spectrum=None  -> EXACT original analytic flat (top-hat) weights.
+    spectrum=phi   -> weighted Legendre quadrature with assumed shape phi(lambda)
+                      and optional kinematic Lorentz correction.
     """
     q = np.asarray(q_mags, dtype=float)
-    # Per-reflection x-interval the band covers. x = -0.5*|q|*lambda, so the
-    # short-wavelength edge (wl_min) is the LEAST negative x (x_max), and the
-    # long-wavelength edge (wl_max) is the MOST negative (x_min). Clip to [-1, 1].
     x_max = np.clip(-0.5 * q * wl_min, -1.0, 1.0)
     x_min = np.clip(-0.5 * q * wl_max, -1.0, 1.0)
 
@@ -399,6 +399,12 @@ def build_band_weights(q_mags, wl_min, wl_max, L_max, spectrum=None, n_quad=4096
     with np.errstate(divide="ignore", invalid="ignore"):
         lam = np.where(q[:, None] > 0, -2.0 * x / q[:, None], 0.0)  # wavelength at each node
     phi = np.asarray(spectrum(lam), dtype=float)
+
+    if lorentz:
+        # Fold the kinematic Lorentz factor (4 * lambda^2 / q^2) into the spectrum weight
+        L_factor = np.where(q[:, None] > 0, 4.0 * (lam ** 2) / (q[:, None] ** 2), 0.0)
+        phi = phi * L_factor
+
     phi = np.where(np.isfinite(phi), phi, 0.0)
 
     P = [np.ones_like(x), x]
@@ -416,6 +422,7 @@ def tracker(
     structure_factors: gemmi.Mtz = None,
     instrument_name: str | None = None,
     assumed_spectrum = None,
+    lorentz_correction: bool = True,
     streaming_callback=None,
     process_q_scale_start: float = 1e-3,
     process_q_scale_end: float = 1e-7,
@@ -437,6 +444,7 @@ def tracker(
     cov_ema_weight: float = 0.1,
     cov_threshold_frac: float = 0.3,
     cov_warmup_events: int = 20000,
+    cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
     sigmoid_k = 10,
 ):
     from subhkl.optimization import FindUB
@@ -526,6 +534,7 @@ def tracker(
     w_l_j = build_band_weights(
        q_mags_np[res_mask], wl_min_tracking, wl_max_tracking, L_max,
        spectrum=assumed_spectrum,
+       lorentz=lorentz_correction,
     )
 
     if U_init is not None:
@@ -545,7 +554,8 @@ def tracker(
         streaming_callback,
         gonio_axes, gonio_offsets,
         L_cov, cov_ema_weight, cov_threshold_frac, cov_warmup_events, sigmoid_k,
-        q_scale_floor
+        q_scale_floor,
+        cos_gate, gate_temp, low_l_damp,
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
