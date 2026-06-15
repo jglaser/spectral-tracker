@@ -90,6 +90,24 @@ def _sh_moments(dirs_unit, L_max):
     return z_norm, adev_norm
 
 
+def _adev_tensors(dirs_unit, L_max, weights=None):
+    """Per-shell deviatoric 2nd-moment TENSORS (not just norms), optionally
+    population-weighted. Same SH convention as _sh_moments, so the OBSERVED
+    (uniform over events) and PREDICTED (weighted over reflections) tensors
+    live in the same basis and compare by Frobenius overlap."""
+    Y = np.asarray(e3x.so3.irreps.spherical_harmonics(
+        jnp.asarray(dirs_unit, dtype=jnp.float32),
+        max_degree=L_max, cartesian_order=False, normalization="orthonormal"))
+    w = np.ones(Y.shape[0]) if weights is None else np.asarray(weights, float)
+    wsum = float(w.sum()) if w.sum() > 0 else 1.0
+    out = {}
+    for l in range(1, L_max + 1):
+        s, e, dim = l * l, (l + 1) * (l + 1), 2 * l + 1
+        Yl = Y[:, s:e]
+        A = (Yl.T * w) @ Yl / wsum * (4.0 * np.pi / dim)
+        out[l] = A - (np.trace(A) / dim) * np.eye(dim)
+    return out
+
 def _coverage(dirs_unit, n_grid=768):
     """Fraction of a Fibonacci tessellation that holds >=1 event, plus a
     clustering measure (share of events in the densest 10% of filled cells)."""
@@ -271,6 +289,87 @@ def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
             "divided_I": imap is not None, "divided_geom": geom is not None, "lorentz": lorentz,
             "spark_obs": _sparkline(obs), "spark_fit": _sparkline(phi(cen))}
 
+def _orientation_match_block(q_unit, ki_mean, cell, U_est, L_max, h_max,
+                             d_min, d_max, wl_band, structure_factors,
+                             lorentz, phi=None):
+    """At the SEED, build predicted shell moments the way the tracker weights them
+    and compare to the OBSERVED moments from event directions. Headline is the
+    per-shell Frobenius overlap of A_dev:
+      ~+1  -> predicted & observed align; seed is a true minimum, so failure to
+              lock lives in the optimizer/annealing, not the model.
+      ~0/neg -> prediction doesn't reproduce the observation at the seed; the model
+              (d-range, band, spectrum, Lorentz) is wrong -- e.g. a d_min that drops
+              a detector sector collapses the overlap on every shell.
+    Uses the SAME d_min/d_max/wl_band passed in: set those to your TRACKER's values
+    to test the tracker configuration."""
+    if sl is None or U_est is None or cell is None:
+        return {"available": False, "reason": "needs cell + U_est"}
+
+    B = sl.reciprocal_B(*cell)
+    hv = np.arange(-h_max, h_max + 1)
+    H, K, L = np.meshgrid(hv, hv, hv, indexing="ij")
+    hkl = np.stack([H.ravel(), K.ravel(), L.ravel()])
+    hkl = hkl[:, ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))]
+    q_theo = B @ hkl
+    qn = np.linalg.norm(q_theo, axis=0)
+    res = (qn > 1.0 / d_max) & (qn < 1.0 / d_min)
+    hkl, q_theo, qn = hkl[:, res], q_theo[:, res], qn[res]
+    if hkl.shape[1] < 8:
+        return {"available": False, "reason": f"only {hkl.shape[1]} reflections in d-range"}
+
+    lam, _ = sl.bragg_wavelengths(q_theo, U_est, ki_mean)
+    finite = np.isfinite(lam) & (lam > 0)
+    if wl_band is None:
+        fl = lam[finite]
+        wl_band = (max(0.1, float(np.percentile(fl, 1))), float(np.percentile(fl, 99)))
+    in_band = finite & (lam > wl_band[0]) & (lam < wl_band[1])
+    if int(in_band.sum()) < 8:
+        return {"available": False, "reason": f"only {int(in_band.sum())} in-band reflections"}
+
+    qhat = q_theo / np.where(qn == 0, 1.0, qn)
+    pred = (np.asarray(U_est, float) @ qhat).T          # (M,3) unit, sample frame
+
+    imap = _intensity_lookup(structure_factors)
+    if imap is not None:
+        I = np.array([imap.get((int(h), int(k), int(l)),
+                               imap.get((-int(h), -int(k), -int(l)), 0.01))
+                      for h, k, l in hkl.T], float)
+        I = np.where(I > 0, I, 0.01)
+    else:
+        I = np.ones(hkl.shape[1])
+    Lf = (np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 1.0)
+          if lorentz else np.ones(hkl.shape[1]))
+    if phi is not None:
+        spec = np.asarray(phi(lam), float)
+        spec = np.where(np.isfinite(spec) & (spec > 0), spec, 0.0)
+    else:
+        spec = np.ones(hkl.shape[1])
+
+    p = np.where(in_band, 1.0, 0.0) * I * Lf * spec
+    p = np.clip(p, 0.0, None)
+    mask = in_band & (p > 0)
+    if int(mask.sum()) < 8:
+        return {"available": False, "reason": f"only {int(mask.sum())} weighted in-band reflections"}
+
+    obs_t = _adev_tensors(q_unit, L_max)                  # uniform over events
+    pred_t = _adev_tensors(pred[mask], L_max, p[mask])    # population-weighted
+
+    per_shell = {}
+    for l in range(1, L_max + 1):
+        Ao, Ap = obs_t[l], pred_t[l]
+        no = float(np.linalg.norm(Ao)); npd = float(np.linalg.norm(Ap))
+        ov = float(np.sum(Ao * Ap) / (no * npd)) if (no > 0 and npd > 0) else float("nan")
+        per_shell[l] = {"obs": no, "pred": npd, "overlap": ov}
+
+    ov2 = [per_shell[l]["overlap"] for l in range(2, L_max + 1)
+           if np.isfinite(per_shell[l]["overlap"])]
+    return {"available": True, "per_shell": per_shell,
+            "mean_overlap_l2": float(np.mean(ov2)) if ov2 else float("nan"),
+            "n_pred": int(mask.sum()),
+            "wl_band": (float(wl_band[0]), float(wl_band[1])),
+            "d_range": (float(d_min), float(d_max)),
+            "weighted_phi": phi is not None, "lorentz": bool(lorentz),
+            "weighted_I": imap is not None}
 
 # ---------------------------------------------------------------------------
 def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
@@ -373,6 +472,12 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         q_unit, ki_mean, cell, U_est, h_max, d_min, d_max, wl_band,
         structure_factors, spectrum_family, cos_min, geom_fn, lorentz)
 
+    orient_match = _orientation_match_block(
+        q_unit, ki_mean, cell, U_est, L_max, h_max, d_min, d_max,
+        (spectrum.get("wl_band") if spectrum.get("available") else wl_band),
+        structure_factors, lorentz,
+        phi=(spectrum.get("phi") if spectrum.get("available") else None))
+
     rep = dict(
         label=label, n_events=N, n_batches=n_batches,
         events_per_batch=N / max(n_batches, 1), duration=dur, rate_hz=rate,
@@ -389,6 +494,7 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         z_ratio=z_ratio, adev_ratio=adev_ratio,
         z_norm=z_norm, adev_norm=adev_norm, L_max=L_max,
         spectrum=spectrum,
+        orientation_match=orient_match,
     )
     _print_report(rep)
     return rep
@@ -448,6 +554,29 @@ def _print_report(r):
             if not sp['divided_I']:
                 print("   note: no |F|^2 supplied -> curve is spectrum x structure (pass "
                       "structure_factors to deconvolve)")
+
+    om = r.get('orientation_match')
+    if om is not None:
+        print(f"\n seed orientation match (predicted vs observed A_dev at U_est)")
+        if not om.get("available"):
+            print(f"   [skipped] {om.get('reason')}")
+        else:
+            dlo, dhi = om["d_range"]; wlo, whi = om["wl_band"]
+            print(f"   pool d=[{dlo:.2f},{dhi:.2f}] A  lambda=[{wlo:.2f},{whi:.2f}] A  "
+                  f"({om['n_pred']} in-band refl) <- set to your TRACKER's d_min/d_max/wl")
+            print(f"   weights: phi={'Y' if om['weighted_phi'] else 'N'} "
+                  f"|F|2={'Y' if om['weighted_I'] else 'N'} lorentz={'Y' if om['lorentz'] else 'N'}")
+            print(f"   {'l':>2} | {'||A_dev|| obs':>13} | {'||A_dev|| pred':>14} | {'overlap':>8}")
+            for l in sorted(om["per_shell"]):
+                d = om["per_shell"][l]
+                flag = ("  <- aligned" if (l >= 2 and d["overlap"] > 0.8) else
+                        "  <- MISMATCH" if (l >= 2 and d["overlap"] < 0.5) else "")
+                print(f"   {l:>2} | {d['obs']:>13.3f} | {d['pred']:>14.3f} | {d['overlap']:>8.3f}{flag}")
+            mo = om["mean_overlap_l2"]
+            verdict = ("seed is a true minimum -> debug optimizer/annealing" if mo > 0.8 else
+                       "prediction != observation at seed -> model (d-range/band/spectrum) mismatch"
+                       if mo < 0.5 else "marginal -> tighten d-range/band to the data")
+            print(f"   mean overlap (l>=2) = {mo:.3f}  <- {verdict}")
 
 
 def compare(a, b):
