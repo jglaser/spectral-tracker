@@ -165,6 +165,115 @@ def _intensity_lookup(structure_factors):
     except Exception:
         return None
 
+# ---------------------------------------------------------------------------
+# Gate-acceptance orientation test (pure numpy). Replaces the A_dev-overlap
+# verdict, which is cap-dominated and misleading under heavy anisotropic
+# background -- it rewards any orientation that fills the detector footprint,
+# not the one whose reflections sit on real peaks. Here the discriminator is
+# the gate ACCEPTANCE COUNT normalized by a uniform-fill-of-footprint null,
+# which cancels the cap. See also _pool_spacing_deg: if the pool tiles the
+# sphere finer than the gate cone, NO metric can discriminate at that cos_gate.
+# ---------------------------------------------------------------------------
+def _pool_dirs(cell, U, h_max, d_min, d_max, structure_factors=None, drop_absences=True):
+    B = sl.reciprocal_B(*cell)
+    hv = np.arange(-h_max, h_max + 1)
+    H, K, L = np.meshgrid(hv, hv, hv, indexing="ij")
+    hkl = np.stack([H.ravel(), K.ravel(), L.ravel()]).astype(float)
+    hkl = hkl[:, ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))]
+    q = B @ hkl; qn = np.linalg.norm(q, axis=0)
+    res = (qn > 1.0 / d_max) & (qn < 1.0 / d_min)
+    hkl, q, qn = hkl[:, res], q[:, res], qn[res]
+    imap = _intensity_lookup(structure_factors)
+    if imap is not None and drop_absences:        # drop systematic absences: their
+        I = np.array([imap.get((int(h), int(k), int(l)),   # "peaks" catch only bg
+                               imap.get((-int(h), -int(k), -int(l)), 0.0))
+                      for h, k, l in hkl.T], float)
+        keep = I > 0
+        hkl, q, qn = hkl[:, keep], q[:, keep], qn[keep]
+    pred = (np.asarray(U, float) @ (q / qn)).T
+    return pred / np.linalg.norm(pred, axis=1, keepdims=True)
+
+def _pool_spacing_deg(pred_unit):
+    """Mean nearest-neighbour angular spacing (deg) of the predicted directions."""
+    if len(pred_unit) < 2:
+        return 180.0
+    d, _ = cKDTree(pred_unit).query(pred_unit, k=2)
+    return float(np.degrees(2 * np.arcsin(np.clip(d[:, 1] / 2, 0, 1))).mean())
+
+def _gate_acceptance(q_unit, pred_unit, cos_gate, chunk=20000):
+    nn = np.empty(len(q_unit))
+    for s in range(0, len(q_unit), chunk):
+        nn[s:s+chunk] = (q_unit[s:s+chunk] @ pred_unit.T).max(axis=1)
+    return float((nn > cos_gate).mean())
+
+def _uniform_in_footprint(observed_dirs, n, rng, n_grid=768):
+    grid = _fibonacci_sphere(n_grid); tree = cKDTree(grid)
+    occ = np.zeros(n_grid, bool); occ[np.unique(tree.query(observed_dirs, k=1)[1])] = True
+    out, got = [], 0
+    while got < n:
+        v = rng.normal(size=(n, 3)); v /= np.linalg.norm(v, axis=1, keepdims=True)
+        k = v[occ[tree.query(v, k=1)[1]]]; out.append(k); got += len(k)
+    return np.vstack(out)[:n]
+
+def orientation_acceptance(q_unit, cell, U, cos_gate=0.9999, h_max=8, d_min=4.0,
+                           d_max=10.0, structure_factors=None, n_null=60000,
+                           n_random=16, max_events=120000, seed=0,
+                           label="U", verbose=True):
+    """contrast = observed_acceptance(U) / null_acceptance(U), null = uniform fill
+    of the observed footprint. >>1 => events concentrate on U's reflections beyond
+    cap-fill (orientation correct). ~1 => only filling the cap (wrong, OR pool too
+    dense to discriminate -- check spacing vs cone)."""
+    if sl is None:
+        return {"available": False, "reason": "spectrum_learning not importable"}
+    if U is None or cell is None:
+        return {"available": False, "reason": "needs cell + U"}
+    rng = np.random.default_rng(seed)
+    q_unit = np.asarray(q_unit, float)
+    if len(q_unit) > max_events:
+        q_unit = q_unit[rng.choice(len(q_unit), max_events, replace=False)]
+    pred = _pool_dirs(cell, U, h_max, d_min, d_max, structure_factors)
+    if len(pred) < 8:
+        return {"available": False, "reason": f"only {len(pred)} reflections in pool"}
+    spacing = _pool_spacing_deg(pred)
+    cone = float(np.degrees(np.arccos(np.clip(cos_gate, -1, 1))))
+    null = _uniform_in_footprint(q_unit, n_null, rng)
+    null_acc = _gate_acceptance(null, pred, cos_gate)
+    obs_acc = _gate_acceptance(q_unit, pred, cos_gate)
+    contrast = obs_acc / max(null_acc, 1e-9)
+
+    rc = []
+    for _ in range(n_random):
+        a = rng.normal(size=3); a /= np.linalg.norm(a); th = rng.uniform(0, np.pi)
+        Ksk = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+        R = np.eye(3) + np.sin(th) * Ksk + (1 - np.cos(th)) * Ksk @ Ksk
+        Pr = _pool_dirs(cell, R @ np.asarray(U, float), h_max, d_min, d_max, structure_factors)
+        rc.append(_gate_acceptance(q_unit, Pr, cos_gate) / max(null_acc, 1e-9))
+    rc = np.array(rc); rc_mean, rc_max = float(rc.mean()), float(rc.max())
+
+    too_dense = spacing < cone
+    if too_dense:
+        verdict = (f"POOL TOO DENSE: spacing {spacing:.2f} < cone {cone:.2f} deg -> predictions "
+                   f"blanket the footprint; no metric discriminates. Raise d_min / lower h_max "
+                   f"or tighten cos_gate until cone < spacing. (This is your lock failure.)")
+    elif contrast > 3.0 and contrast > 2.0 * rc_max:
+        verdict = (f"orientation CORRECT & discriminable: {contrast:.1f}x over cap-fill "
+                   f"(random orientations only {rc_max:.1f}x).")
+    elif contrast > 1.5:
+        verdict = f"weak concentration ({contrast:.1f}x); sparsen pool / tighten gate."
+    else:
+        verdict = (f"NO concentration beyond cap-fill ({contrast:.1f}x ~ random {rc_mean:.1f}x): "
+                   f"wrong orientation OR no Bragg signal in this band.")
+    if verbose:
+        print(f"\n gate-acceptance orientation test [{label}]  (cos_gate={cos_gate}, cone={cone:.2f} deg)")
+        print(f"   pool {len(pred)} refl, mean NN spacing {spacing:.2f} deg "
+              f"({'cone<spacing OK' if not too_dense else 'TOO DENSE'})")
+        print(f"   observed {obs_acc:.4f} | footprint-null {null_acc:.4f} | CONTRAST {contrast:.2f}x")
+        print(f"   random-orientation contrast: mean {rc_mean:.2f}x  max {rc_max:.2f}x")
+        print(f"   => {verdict}")
+    return {"available": True, "contrast": contrast, "obs_acc": obs_acc, "null_acc": null_acc,
+            "spacing_deg": spacing, "cone_deg": cone, "too_dense": too_dense,
+            "random_contrast_mean": rc_mean, "random_contrast_max": rc_max,
+            "n_pool": len(pred), "verdict": verdict}
 
 def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
                     wl_band, structure_factors, family, cos_min, geom_fn, lorentz=True):
@@ -516,6 +625,8 @@ def orientation_scan(rep, U_seed, structure_factors=None, lorentz=True, phi="aut
         print(f"   best overlap (l>=2)  = {best:.3f}   at angle(R) = {ang:.1f} deg from identity")
         print(f"   per-shell @ best: " + " ".join(f"l{l}:{per_shell[l]:+.2f}" for l in sorted(per_shell)))
         print(f"   => {verdict}")
+        print("   [warning] A_dev-overlap objective is cap-dominated under anisotropic")
+        print("             background; cross-check with orientation_acceptance().")
     return {"best_R": best_R, "best_overlap": best, "seed_overlap": seed_ov,
             "angle_deg": ang, "per_shell": per_shell, "verdict": verdict}
 
@@ -524,6 +635,7 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
                          L_max=8, n_grid=768, mc_baseline=True, label="",
                          cell=None, U_est=None, ki_vec=None,
                          h_max=6, d_min=1.0, d_max=10.0, wl_band=None,
+                         accept_cos_gate=0.9999, accept_d_min=None, accept_h_max=None,
                          structure_factors=None, spectrum_family="lognormal",
                          cos_min=0.999, geom_fn=None, lorentz=False):
     qs, ts, kis, angs = [], [], [], []
@@ -627,6 +739,15 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         phi=(spectrum.get("phi") if spectrum.get("available") else None),
         coverage_mask=True)
 
+    orient_accept = orientation_acceptance(
+        q_unit, cell, U_est,
+        cos_gate=accept_cos_gate,
+        h_max=(accept_h_max or h_max),
+        d_min=(accept_d_min or max(d_min, 4.0)),   # default to a SPARSE pool
+        d_max=d_max, structure_factors=structure_factors,
+        label=label or "U_est", verbose=False) if (cell is not None and U_est is not None) \
+        else {"available": False, "reason": "needs cell + U_est"}
+
     _ss = np.random.default_rng(0).choice(N, size=min(N, 100_000), replace=False)
     rep_scan = {"q_unit": q_unit[_ss], "ki_mean": ki_mean, "cell": cell}
 
@@ -647,6 +768,7 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         z_norm=z_norm, adev_norm=adev_norm, L_max=L_max,
         spectrum=spectrum,
         orientation_match=orient_match,
+        orientation_acceptance=orient_accept,
         _scan=rep_scan,
     )
     _print_report(rep)
@@ -730,6 +852,17 @@ def _print_report(r):
                        "prediction != observation at seed -> model (d-range/band/spectrum) mismatch"
                        if mo < 0.5 else "marginal -> tighten d-range/band to the data")
             print(f"   mean overlap (l>=2) = {mo:.3f}  <- {verdict}")
+
+    oa = r.get('orientation_acceptance')
+    if oa is not None and oa.get("available"):
+        print(f"\n gate-acceptance orientation test (footprint-null normalized)")
+        print(f"   pool {oa['n_pool']} refl, NN spacing {oa['spacing_deg']:.2f} deg vs gate cone {oa['cone_deg']:.2f} deg")
+        print(f"   CONTRAST {oa['contrast']:.2f}x  (random orientations {oa['random_contrast_mean']:.2f}x) "
+              f"<- THIS is the orientation verdict, not A_dev overlap")
+        print(f"   => {oa['verdict']}")
+    if r.get('clustering_top10_lab', 1.0) < 0.4 and r.get('orientation_match', {}).get('available'):
+        print("   NOTE: background is diffuse/cap-like -> the A_dev overlap verdict above is "
+              "unreliable; defer to the gate-acceptance contrast.")
 
 
 def compare(a, b):
