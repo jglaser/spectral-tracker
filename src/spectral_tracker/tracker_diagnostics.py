@@ -45,9 +45,10 @@ import e3x
 from scipy.spatial import cKDTree
 
 try:
-    from subhkl.instrument.goniometer import sample_to_lab
+    from subhkl.instrument.goniometer import sample_to_lab, lab_to_sample
 except Exception:
     sample_to_lab = None
+    lab_to_sample = None
 
 try:
     from spectral_tracker import spectrum_learning as sl          # Route B, Step 1 estimator (pure numpy)
@@ -261,6 +262,7 @@ def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
     obs = np.where(wsum > 0, obs / np.where(wsum == 0, 1.0, wsum), 0.0)
 
     return {"available": True, "family": family, "params": params, "mode": float(mode),
+            "phi": phi,                 # callable lam -> unnormalized weight (for tracker)
             "wl_band": (float(wl_band[0]), float(wl_band[1])),
             "n_singles_inband": int(singles.sum()), "n_singles_used": info["n_singles_used"],
             "assigned_frac": float(keep.mean()), "cos_min": float(cos_min),
@@ -305,8 +307,32 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
     # --- vector sanity ---
     qmag = np.linalg.norm(q.astype(np.float64), axis=1)
     ki_unit = _unit(ki.astype(np.float64))
-    ki_mean = np.asarray(ki_vec, float) if ki_vec is not None else _unit(
-        np.median(ki_unit, axis=0)[None])[0]
+
+    # The loader de-rotates every event into the SAMPLE frame, so the streamed ki
+    # (b[7]) is already the sample-frame beam -- exactly what bragg_wavelengths
+    # needs, since U @ q_hat also lives in the sample frame. This is the source of
+    # truth for tagging. A user-supplied ki_vec follows the subhkl convention and
+    # is in the LAB frame; it must be de-rotated by the goniometer (R^T) before it
+    # can be used for tagging, or it tilts every tagged wavelength by the setting.
+    ki_mean = _unit(np.median(ki_unit, axis=0)[None])[0]
+    if ki_vec is not None:
+        ki_lab = _unit(np.asarray(ki_vec, float)[None])[0]
+        ki_lab_in_sample = ki_lab
+        if (lab_to_sample is not None and gonio_axes is not None
+                and ang.size and ang.shape[-1] == len(np.asarray(gonio_axes))):
+            try:
+                a0 = ang[0] if ang.shape[0] == N else ang[:, 0]   # (num_axes,) representative setting
+                ki_lab_in_sample = _unit(np.atleast_2d(np.asarray(
+                    lab_to_sample(ki_lab, np.asarray(gonio_axes), a0, None,
+                                  zero_offsets=gonio_offsets, is_vector=True))))[0]
+            except Exception as ex:
+                print(f"  [spectrum] lab->sample ki de-rotation skipped: {ex}")
+        # Prefer the stream; the converted lab vector is a cross-check / fallback.
+        disagree = float(np.degrees(np.arccos(np.clip(ki_mean @ ki_lab_in_sample, -1, 1))))
+        if disagree > 1.0:
+            print(f"  [spectrum] note: supplied (lab) ki de-rotates to a sample-frame beam "
+                  f"{disagree:.1f} deg from the streamed beam; using the streamed beam for "
+                  f"tagging. Pass ki_vec=None to silence.")
     nbins = 50
     hq, _ = np.histogram(qmag, bins=nbins)
     densest_qbin = float(hq.max() / hq.sum()) if hq.sum() else 0.0   # uniform ~ 1/nbins
@@ -416,6 +442,7 @@ def _print_report(r):
                   f"events assigned {100*sp['assigned_frac']:.0f}% (cos>= {sp['cos_min']:.3f}) | "
                   f"bg/cap={sp['c_bg']:.0f} ({sp['n_monitors']} monitors) | "
                   f"divided: I={'Y' if sp['divided_I'] else 'N'} geom={'Y' if sp['divided_geom'] else 'N'} lorentz={'Y' if sp.get('lorentz') else 'N'}")
+
             print(f"   phi_hat  {sp['spark_obs']}")
             print(f"   fit      {sp['spark_fit']}   ({lo:.1f} -> {hi:.1f} A)")
             if not sp['divided_I']:
