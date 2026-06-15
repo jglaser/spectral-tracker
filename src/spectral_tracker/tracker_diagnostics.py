@@ -466,7 +466,8 @@ def orientation_scan(rep, U_seed, structure_factors=None, lorentz=True, phi="aut
             m = m & occ[gtree.query(pred, k=1)[1]]
         if int(m.sum()) < 8:
             return -1.0, None
-        pt = _adev_tensors(pred[m], L_max, p[m])
+        w = np.where(m, p, 0.0)              # full-length weights -> pred stays (M,3)
+        pt = _adev_tensors(pred, L_max, w)   # SH shape is constant -> compiles ONCE
         ovs = []
         for l in range(2, L_max + 1):
             Ao, Ap = obs_t[l], pt[l]
