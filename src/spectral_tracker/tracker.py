@@ -178,6 +178,7 @@ def kalman_subspace_update(
 def process_chunk_field_kalman(
     P_prev, q_batch, ki_batch, t_batch,
     q_theo_sample_jax, w_l_j, I_weights_jax,
+    q_mags_jax, wl_min, wl_max, I_thresh,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_base,
     current_q_scale,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k,
@@ -194,14 +195,20 @@ def process_chunk_field_kalman(
         q_batch, max_degree=L_max, cartesian_order=False, normalization="orthonormal")
 
     # --- event-level signal gate -------------------------------------------------
-    # Soft proximity of each (unit) event direction to the nearest predicted
-    # Bragg direction. Discrimination scales with how sparsely the active
-    # reflections tile the sphere -- best with the correct narrow bandpass.
-    q_pred = U_base @ q_theo_sample_jax            # (3, M); columns are unit vectors
-    cos_sim = q_batch @ q_pred                     # (N, M)
-    nn_cos = jnp.max(cos_sim, axis=1)              # (N,)
-    w = jax.nn.sigmoid((nn_cos - cos_gate) / gate_temp)  # (N,) in [0, 1]
- 
+    q_pred = U_base @ q_theo_sample_jax            # (3, M) unit dirs, sample frame
+
+    # in-band, strong reflections only — computed on host so the boolean index is concrete
+    lam = -2.0 * (ki_batch[0] @ q_pred) / q_mags_jax            # (M,)
+    ref = np.asarray((lam > wl_min) & (lam < wl_max) & (I_weights_jax > I_thresh))
+
+    if int(ref.sum()) == 0:                        # nothing eligible -> don't update on noise
+        return (P_prev + jnp.eye(3) * (current_q_scale * dt_chunk),
+                U_base, jnp.array(0.0), jnp.array(0.0), total_rate)
+
+    cos_sim = q_batch @ q_pred[:, ref]             # (N, M_ref)  <-- no full (N,M), no where-copy
+    nn_cos = jnp.max(cos_sim, axis=1)
+    w = jax.nn.sigmoid((nn_cos - cos_gate) / gate_temp)
+
     # WEIGHTED sufficient statistics (background suppressed in the moment itself).
     eff_count = jnp.maximum(jnp.sum(w), 1.0)
     Y_w = Y_events_sample * w[:, None]
@@ -244,6 +251,7 @@ def process_chunk_field_kalman(
 def _tracker_loop_reference(
     finder_file, event_batches, U_curr, P_spectral_full,
     q_theo_sample_jax, w_l_j, I_weights_jax,
+    q_mags_jax, wl_min, wl_max, I_thresh,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max,
     process_q_scale_start, process_q_scale_end, annealing_rate,
     streaming_callback,
@@ -336,6 +344,7 @@ def _tracker_loop_reference(
         P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
             q_theo_sample_jax, w_l_j, I_weights_jax,
+            q_mags_jax, wl_min, wl_max, I_thresh,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
             current_q_scale,
             R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
@@ -446,6 +455,7 @@ def tracker(
     cov_warmup_events: int = 20000,
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
     sigmoid_k = 10,
+    gate_I_quantile: float = 0.0,          # 0 = in-band only; 0.5–0.75 sparsens by |F|
 ):
     from subhkl.optimization import FindUB
 
@@ -487,6 +497,12 @@ def tracker(
 
     M_peaks = q_mags_np[res_mask].shape[0]
     I_weights = np.ones(M_peaks, dtype=np.float32)
+
+    if gate_I_quantile > 0.0 and np.ptp(I_weights) > 0:
+        I_thresh = float(np.quantile(I_weights, gate_I_quantile))
+    else:
+        I_thresh = -np.inf                 # keep every in-band reflection (no |F| cut)
+
 
     if structure_factors is not None:
         print("[*] Gemmi Structure Factors provided. Mapping physical intensities to Ewald model...")
@@ -549,6 +565,7 @@ def tracker(
     tracking_history = _tracker_loop_reference(
         finder_file, event_batches, U_curr, P_spectral_full,
         q_theo_sample_jax, w_l_j, I_weights_jax,
+        q_mags_jax, wl_min_tracking, wl_max_tracking, I_thresh,
         meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max,
         process_q_scale_start, process_q_scale_end, annealing_rate,
         streaming_callback,
