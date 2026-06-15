@@ -289,19 +289,25 @@ def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
             "divided_I": imap is not None, "divided_geom": geom is not None, "lorentz": lorentz,
             "spark_obs": _sparkline(obs), "spark_fit": _sparkline(phi(cen))}
 
+def _footprint_mask(test_dirs, observed_dirs, n_grid=768):
+    """True for test directions that land in a Fibonacci cell the observed events
+    actually populate -- i.e. inside the detector footprint. Lets the predicted
+    set be compared on the SAME ~solid angle the data covers."""
+    grid = _fibonacci_sphere(n_grid)
+    tree = cKDTree(grid)
+    occ = np.zeros(n_grid, bool)
+    occ[np.unique(tree.query(np.asarray(observed_dirs, float), k=1)[1])] = True
+    return occ[tree.query(np.asarray(test_dirs, float), k=1)[1]]
+
 def _orientation_match_block(q_unit, ki_mean, cell, U_est, L_max, h_max,
                              d_min, d_max, wl_band, structure_factors,
-                             lorentz, phi=None):
+                             lorentz, phi=None, coverage_mask=True, n_grid=768):
     """At the SEED, build predicted shell moments the way the tracker weights them
-    and compare to the OBSERVED moments from event directions. Headline is the
-    per-shell Frobenius overlap of A_dev:
-      ~+1  -> predicted & observed align; seed is a true minimum, so failure to
-              lock lives in the optimizer/annealing, not the model.
-      ~0/neg -> prediction doesn't reproduce the observation at the seed; the model
-              (d-range, band, spectrum, Lorentz) is wrong -- e.g. a d_min that drops
-              a detector sector collapses the overlap on every shell.
-    Uses the SAME d_min/d_max/wl_band passed in: set those to your TRACKER's values
-    to test the tracker configuration."""
+    and compare to OBSERVED moments via per-shell Frobenius overlap of A_dev.
+    coverage_mask restricts predicted reflections to the observed detector
+    footprint, so the comparison is on the same solid angle (without it the
+    predicted tensor is set by reflections you never see, which alone can drive
+    the overlap to 0 even at a correct seed)."""
     if sl is None or U_est is None or cell is None:
         return {"available": False, "reason": "needs cell + U_est"}
 
@@ -348,8 +354,12 @@ def _orientation_match_block(q_unit, ki_mean, cell, U_est, L_max, h_max,
     p = np.where(in_band, 1.0, 0.0) * I * Lf * spec
     p = np.clip(p, 0.0, None)
     mask = in_band & (p > 0)
+    n_full = int(mask.sum())
+    if coverage_mask:
+        mask = mask & _footprint_mask(pred, q_unit, n_grid)
     if int(mask.sum()) < 8:
-        return {"available": False, "reason": f"only {int(mask.sum())} weighted in-band reflections"}
+        return {"available": False,
+                "reason": f"only {int(mask.sum())} in-band+in-footprint reflections"}
 
     obs_t = _adev_tensors(q_unit, L_max)                  # uniform over events
     pred_t = _adev_tensors(pred[mask], L_max, p[mask])    # population-weighted
@@ -365,11 +375,148 @@ def _orientation_match_block(q_unit, ki_mean, cell, U_est, L_max, h_max,
            if np.isfinite(per_shell[l]["overlap"])]
     return {"available": True, "per_shell": per_shell,
             "mean_overlap_l2": float(np.mean(ov2)) if ov2 else float("nan"),
-            "n_pred": int(mask.sum()),
+            "n_pred": int(mask.sum()), "n_pred_full": n_full,
+            "coverage_masked": bool(coverage_mask),
             "wl_band": (float(wl_band[0]), float(wl_band[1])),
             "d_range": (float(d_min), float(d_max)),
             "weighted_phi": phi is not None, "lorentz": bool(lorentz),
             "weighted_I": imap is not None}
+
+def _rand_rotations(n, rng):
+    q = rng.normal(size=(n, 4)); q /= np.linalg.norm(q, axis=1, keepdims=True)
+    w, x, y, z = q.T
+    R = np.empty((n, 3, 3))
+    R[:, 0, 0] = 1-2*(y*y+z*z); R[:, 0, 1] = 2*(x*y-z*w); R[:, 0, 2] = 2*(x*z+y*w)
+    R[:, 1, 0] = 2*(x*y+z*w); R[:, 1, 1] = 1-2*(x*x+z*z); R[:, 1, 2] = 2*(y*z-x*w)
+    R[:, 2, 0] = 2*(x*z-y*w); R[:, 2, 1] = 2*(y*z+x*w); R[:, 2, 2] = 1-2*(x*x+y*y)
+    return R
+
+def _angle_deg(R):
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
+def orientation_scan(rep, U_seed, structure_factors=None, lorentz=True, phi="auto",
+                     L_max=6, h_max=8, d_min=1.0, d_max=10.0, wl_band="auto",
+                     coverage_mask=True, n_grid=768, n_coarse=3000,
+                     refine_scales=(0.3, 0.1, 0.03, 0.01), n_refine=1500,
+                     seed=0, verbose=True):
+    """Search SO(3) for R maximizing the mean l>=2 overlap of predicted(R @ U_seed)
+    vs observed A_dev. Resolves the seed fork:
+      best~1, angle~0    -> seed is correct; lock failure is optimizer/annealing.
+      best~1, angle large-> seed is in the WRONG FRAME; use R @ U_seed (this R is
+                            your indexer<->loader goniometer/ki offset).
+      best stays low     -> no orientation matches: cell/d-range/band/data problem
+                            (wrong or stale index), not initialization.
+    Needs analyze_event_stream(...) to have stashed rep['_scan']."""
+    ctx = rep["_scan"]
+    q_unit, ki_mean, cell = ctx["q_unit"], ctx["ki_mean"], ctx["cell"]
+    if phi == "auto":
+        sp = rep.get("spectrum") or {}
+        phi = sp.get("phi") if sp.get("available") else None
+    if wl_band == "auto":
+        sp = rep.get("spectrum") or {}
+        wl_band = sp.get("wl_band") if sp.get("available") else None
+    rng = np.random.default_rng(seed)
+
+    # R-independent pool
+    B = sl.reciprocal_B(*cell)
+    hv = np.arange(-h_max, h_max + 1)
+    H, K, L = np.meshgrid(hv, hv, hv, indexing="ij")
+    hkl = np.stack([H.ravel(), K.ravel(), L.ravel()])
+    hkl = hkl[:, ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))]
+    q_theo = B @ hkl
+    qn = np.linalg.norm(q_theo, axis=0)
+    res = (qn > 1.0 / d_max) & (qn < 1.0 / d_min)
+    hkl, q_theo, qn = hkl[:, res], q_theo[:, res], qn[res]
+    qhat = q_theo / np.where(qn == 0, 1.0, qn)
+    imap = _intensity_lookup(structure_factors)
+    if imap is not None:
+        I = np.array([imap.get((int(h), int(k), int(l)),
+                               imap.get((-int(h), -int(k), -int(l)), 0.01))
+                      for h, k, l in hkl.T], float)
+        I = np.where(I > 0, I, 0.01)
+    else:
+        I = np.ones(hkl.shape[1])
+
+    obs_t = _adev_tensors(q_unit, L_max)               # observed, once
+    grid = _fibonacci_sphere(n_grid); gtree = cKDTree(grid)
+    occ = np.zeros(n_grid, bool)
+    occ[np.unique(gtree.query(np.asarray(q_unit, float), k=1)[1])] = True
+    U_seed = np.asarray(U_seed, float)
+
+    def objective(Ucand):
+        proj = np.asarray(ki_mean, float) @ (Ucand @ qhat)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            lam = -2.0 * proj / np.where(qn == 0, np.nan, qn)
+        finite = np.isfinite(lam) & (lam > 0)
+        band = wl_band if wl_band is not None else (
+            max(0.1, float(np.percentile(lam[finite], 1))), float(np.percentile(lam[finite], 99)))
+        in_band = finite & (lam > band[0]) & (lam < band[1])
+        if int(in_band.sum()) < 8:
+            return -1.0, None
+        pred = (Ucand @ qhat).T
+        Lf = (np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 1.0)
+              if lorentz else np.ones(hkl.shape[1]))
+        spec = np.ones(hkl.shape[1])
+        if phi is not None:
+            s = np.asarray(phi(lam), float); spec = np.where(np.isfinite(s) & (s > 0), s, 0.0)
+        p = np.where(in_band, 1.0, 0.0) * I * Lf * spec
+        p = np.clip(p, 0.0, None)
+        m = in_band & (p > 0)
+        if coverage_mask:
+            m = m & occ[gtree.query(pred, k=1)[1]]
+        if int(m.sum()) < 8:
+            return -1.0, None
+        pt = _adev_tensors(pred[m], L_max, p[m])
+        ovs = []
+        for l in range(2, L_max + 1):
+            Ao, Ap = obs_t[l], pt[l]
+            no, npd = np.linalg.norm(Ao), np.linalg.norm(Ap)
+            if no > 0 and npd > 0:
+                ovs.append(float(np.sum(Ao * Ap) / (no * npd)))
+        return (float(np.mean(ovs)) if ovs else -1.0), pt
+
+    seed_ov, _ = objective(U_seed)
+    best_R = np.eye(3); best, _ = objective(U_seed)
+    for R in _rand_rotations(n_coarse, rng):
+        v, _ = objective(R @ U_seed)
+        if v > best:
+            best, best_R = v, R
+    for sc in refine_scales:
+        ax = rng.normal(size=(n_refine, 3)); ax /= np.linalg.norm(ax, axis=1, keepdims=True)
+        ths = sc * rng.normal(size=n_refine)
+        for i in range(n_refine):
+            a = ax[i]; th = ths[i]
+            w_ = np.cos(th/2); x_, y_, z_ = np.sin(th/2) * a
+            Rd = np.array([[1-2*(y_*y_+z_*z_), 2*(x_*y_-z_*w_), 2*(x_*z_+y_*w_)],
+                           [2*(x_*y_+z_*w_), 1-2*(x_*x_+z_*z_), 2*(y_*z_-x_*w_)],
+                           [2*(x_*z_-y_*w_), 2*(y_*z_+x_*w_), 1-2*(x_*x_+y_*y_)]])
+            v, _ = objective((Rd @ best_R) @ U_seed)
+            if v > best:
+                best, best_R = v, Rd @ best_R
+
+    _, pt = objective(best_R @ U_seed)
+    per_shell = {}
+    for l in range(1, L_max + 1):
+        Ao = obs_t[l]; Ap = pt[l] if pt is not None else np.zeros_like(Ao)
+        no, npd = float(np.linalg.norm(Ao)), float(np.linalg.norm(Ap))
+        per_shell[l] = (float(np.sum(Ao*Ap)/(no*npd)) if no > 0 and npd > 0 else float("nan"))
+    ang = _angle_deg(best_R)
+    if best > 0.8 and ang < 5:
+        verdict = "seed is correct -> lock failure is optimizer/annealing, not the seed"
+    elif best > 0.8:
+        verdict = f"seed is in the WRONG FRAME by {ang:.1f} deg -> use (best_R @ U_seed) as the seed"
+    elif best > 0.5:
+        verdict = f"partial match at {ang:.1f} deg -> tighten d-range/band; cell may be slightly off"
+    else:
+        verdict = "NO orientation matches -> cell / d-range / band / wrong-or-stale index, not init"
+    if verbose:
+        print(f"\n SO(3) orientation scan (best R @ U_seed vs observed A_dev)")
+        print(f"   seed overlap (l>=2)  = {seed_ov:.3f}")
+        print(f"   best overlap (l>=2)  = {best:.3f}   at angle(R) = {ang:.1f} deg from identity")
+        print(f"   per-shell @ best: " + " ".join(f"l{l}:{per_shell[l]:+.2f}" for l in sorted(per_shell)))
+        print(f"   => {verdict}")
+    return {"best_R": best_R, "best_overlap": best, "seed_overlap": seed_ov,
+            "angle_deg": ang, "per_shell": per_shell, "verdict": verdict}
 
 # ---------------------------------------------------------------------------
 def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
@@ -476,7 +623,11 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         q_unit, ki_mean, cell, U_est, L_max, h_max, d_min, d_max,
         (spectrum.get("wl_band") if spectrum.get("available") else wl_band),
         structure_factors, lorentz,
-        phi=(spectrum.get("phi") if spectrum.get("available") else None))
+        phi=(spectrum.get("phi") if spectrum.get("available") else None),
+        coverage_mask=True)
+
+    _ss = np.random.default_rng(0).choice(N, size=min(N, 100_000), replace=False)
+    rep_scan = {"q_unit": q_unit[_ss], "ki_mean": ki_mean, "cell": cell}
 
     rep = dict(
         label=label, n_events=N, n_batches=n_batches,
@@ -495,6 +646,7 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         z_norm=z_norm, adev_norm=adev_norm, L_max=L_max,
         spectrum=spectrum,
         orientation_match=orient_match,
+        _scan=rep_scan,
     )
     _print_report(rep)
     return rep
