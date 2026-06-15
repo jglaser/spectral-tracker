@@ -148,7 +148,7 @@ def _intensity_lookup(structure_factors):
 
 
 def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
-                    wl_band, structure_factors, family, cos_min, geom_fn):
+                    wl_band, structure_factors, family, cos_min, geom_fn, lorentz=True):
     """
     Learn the APPARENT incident spectrum from reflection populations, using the
     Step 1 estimator. Active only when cell + U_est are supplied. Reports the
@@ -221,6 +221,14 @@ def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
     else:
         I = np.ones(hkl.shape[1])
 
+    if lorentz:
+        # Kinematic Lorentz factor for stationary sample (Laue)
+        # L = lambda^4 / sin^2(theta)
+        # Substitute sin(theta) = lambda / 2d = lambda * qn / 2  ->  L = 4 * lambda^2 / qn^2
+        # Fitter expects this folded into the predictor I.
+        L_factor = np.where(qn > 0, 4.0 * (lam ** 2) / (qn ** 2), 1.0)
+        I = I * L_factor
+
     geom = None
     if geom_fn is not None:
         geom = np.where(in_band, np.asarray(geom_fn(lam), float), 1.0)
@@ -253,13 +261,12 @@ def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
     obs = np.where(wsum > 0, obs / np.where(wsum == 0, 1.0, wsum), 0.0)
 
     return {"available": True, "family": family, "params": params, "mode": float(mode),
-            "phi": phi,                 # callable lam -> unnormalized weight (for tracker)
             "wl_band": (float(wl_band[0]), float(wl_band[1])),
             "n_singles_inband": int(singles.sum()), "n_singles_used": info["n_singles_used"],
             "assigned_frac": float(keep.mean()), "cos_min": float(cos_min),
             "c_bg": c_bg, "n_monitors": int(monitor.sum()),
             "lam_used_pct": tuple(float(x) for x in np.percentile(lam_used, [5, 50, 95])),
-            "divided_I": imap is not None, "divided_geom": geom is not None,
+            "divided_I": imap is not None, "divided_geom": geom is not None, "lorentz": lorentz,
             "spark_obs": _sparkline(obs), "spark_fit": _sparkline(phi(cen))}
 
 
@@ -269,7 +276,7 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
                          cell=None, U_est=None, ki_vec=None,
                          h_max=6, d_min=1.0, d_max=10.0, wl_band=None,
                          structure_factors=None, spectrum_family="lognormal",
-                         cos_min=0.999, geom_fn=None):
+                         cos_min=0.999, geom_fn=None, lorentz=False):
     qs, ts, kis, angs = [], [], [], []
     batch_spans = []          # per-batch goniometer sweep (deg)
     n_batches = 0
@@ -338,7 +345,7 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
     # --- learned (apparent) incident spectrum, if cell + orientation supplied ---
     spectrum = _spectrum_block(
         q_unit, ki_mean, cell, U_est, h_max, d_min, d_max, wl_band,
-        structure_factors, spectrum_family, cos_min, geom_fn)
+        structure_factors, spectrum_family, cos_min, geom_fn, lorentz)
 
     rep = dict(
         label=label, n_events=N, n_batches=n_batches,
@@ -408,7 +415,7 @@ def _print_report(r):
             print(f"   singles used {sp['n_singles_used']}/{sp['n_singles_inband']} | "
                   f"events assigned {100*sp['assigned_frac']:.0f}% (cos>= {sp['cos_min']:.3f}) | "
                   f"bg/cap={sp['c_bg']:.0f} ({sp['n_monitors']} monitors) | "
-                  f"divided: I={'Y' if sp['divided_I'] else 'N'} geom={'Y' if sp['divided_geom'] else 'N'}")
+                  f"divided: I={'Y' if sp['divided_I'] else 'N'} geom={'Y' if sp['divided_geom'] else 'N'} lorentz={'Y' if sp.get('lorentz') else 'N'}")
             print(f"   phi_hat  {sp['spark_obs']}")
             print(f"   fit      {sp['spark_fit']}   ({lo:.1f} -> {hi:.1f} A)")
             if not sp['divided_I']:

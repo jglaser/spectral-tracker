@@ -422,7 +422,7 @@ def tracker(
     structure_factors: gemmi.Mtz = None,
     instrument_name: str | None = None,
     assumed_spectrum = None,
-    lorentz_correction: bool = True,
+    lorentz_correction: bool = False,
     streaming_callback=None,
     process_q_scale_start: float = 1e-3,
     process_q_scale_end: float = 1e-7,
