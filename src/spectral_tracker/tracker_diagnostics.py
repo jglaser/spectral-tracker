@@ -215,6 +215,100 @@ def _uniform_in_footprint(observed_dirs, n, rng, n_grid=768):
         k = v[occ[tree.query(v, k=1)[1]]]; out.append(k); got += len(k)
     return np.vstack(out)[:n]
 
+def angular_power_spectrum(rep, U_seed, structure_factors=None, lorentz=True, phi="auto",
+                           L_max=8, h_max=8, d_min=2.0, d_max=10.0, wl_band="auto",
+                           coverage_mask=True, n_grid=768, overlap_thr=0.45, verbose=True):
+    """Per-shell angular power of OBSERVED events vs the U_seed Bragg model, and
+    their per-shell A_dev overlap. Decides whether orientation is recoverable
+    WITHOUT gating: smooth background (cap, broad diffuse) lives at low l, so the
+    overlap stays high at high l (drop low l, run ungated); sharp broadband
+    background (blobs/rings) collapses the high-l overlap (gating or a background
+    model is genuinely required). Grounded on the verified seed, not a scan."""
+    ctx = rep["_scan"]
+    q_unit, ki_mean, cell = ctx["q_unit"], ctx["ki_mean"], ctx["cell"]
+    if phi == "auto":
+        sp = rep.get("spectrum") or {}; phi = sp.get("phi") if sp.get("available") else None
+    if wl_band == "auto":
+        sp = rep.get("spectrum") or {}; wl_band = sp.get("wl_band") if sp.get("available") else None
+
+    B = sl.reciprocal_B(*cell)
+    hv = np.arange(-h_max, h_max + 1)
+    H, K, L = np.meshgrid(hv, hv, hv, indexing="ij")
+    hkl = np.stack([H.ravel(), K.ravel(), L.ravel()])
+    hkl = hkl[:, ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))]
+    q_theo = B @ hkl; qn = np.linalg.norm(q_theo, axis=0)
+    res = (qn > 1.0 / d_max) & (qn < 1.0 / d_min)
+    hkl, q_theo, qn = hkl[:, res], q_theo[:, res], qn[res]
+    qhat = q_theo / np.where(qn == 0, 1.0, qn)
+    pred = (np.asarray(U_seed, float) @ qhat).T
+
+    lam, _ = sl.bragg_wavelengths(q_theo, U_seed, ki_mean)
+    finite = np.isfinite(lam) & (lam > 0)
+    if wl_band is None:
+        fl = lam[finite]; wl_band = (max(0.1, float(np.percentile(fl, 1))), float(np.percentile(fl, 99)))
+    in_band = finite & (lam > wl_band[0]) & (lam < wl_band[1])
+    imap = _intensity_lookup(structure_factors)
+    if imap is not None:
+        I = np.array([imap.get((int(h), int(k), int(l)),
+                               imap.get((-int(h), -int(k), -int(l)), 0.01)) for h, k, l in hkl.T], float)
+        I = np.where(I > 0, I, 0.01)
+    else:
+        I = np.ones(hkl.shape[1])
+    Lf = (np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 1.0) if lorentz else np.ones(hkl.shape[1]))
+    spec = np.ones(hkl.shape[1])
+    if phi is not None:
+        s = np.asarray(phi(lam), float); spec = np.where(np.isfinite(s) & (s > 0), s, 0.0)
+    p = np.clip(np.where(in_band, 1.0, 0.0) * I * Lf * spec, 0.0, None)
+    mask = in_band & (p > 0)
+    if coverage_mask:
+        mask = mask & _footprint_mask(pred, q_unit, n_grid)
+    if int(mask.sum()) < 8:
+        return {"available": False, "reason": f"only {int(mask.sum())} in-band+footprint refl"}
+
+    obs_t = _adev_tensors(q_unit, L_max)
+    pred_t = _adev_tensors(pred[mask], L_max, p[mask])
+    rng = np.random.default_rng(0)
+    iso = _adev_tensors(rng.normal(size=(min(len(q_unit), 100000), 3)) /
+                        np.linalg.norm(rng.normal(size=(min(len(q_unit), 100000), 3)), axis=1, keepdims=True), L_max)
+
+    per_shell = {}
+    for l in range(1, L_max + 1):
+        Ao, Ap, Ai = obs_t[l], pred_t[l], iso[l]
+        no, npd, ni = (float(np.linalg.norm(Ao)), float(np.linalg.norm(Ap)),
+                       float(np.linalg.norm(Ai)) + 1e-12)
+        ov = float(np.sum(Ao * Ap) / (no * npd)) if (no > 0 and npd > 0) else float("nan")
+        per_shell[l] = {"obs": no, "pred": npd, "obs_over_iso": no / ni,
+                        "obs_over_pred": (no / npd if npd > 0 else float("nan")), "overlap": ov}
+
+    # recommended l_min: smallest l>=2 from which overlap stays above threshold
+    l_rec = None
+    for l in range(2, L_max + 1):
+        if all(per_shell[k]["overlap"] > overlap_thr for k in range(l, L_max + 1)
+               if np.isfinite(per_shell[k]["overlap"])):
+            l_rec = l; break
+    hi = [per_shell[l]["overlap"] for l in range((l_rec or L_max), L_max + 1)
+          if np.isfinite(per_shell[l]["overlap"])]
+    mean_hi = float(np.mean(hi)) if hi else float("nan")
+    removable = (l_rec is not None) and (mean_hi > overlap_thr)
+
+    if removable:
+        verdict = (f"orientation lives in l>={l_rec} (mean overlap {mean_hi:+.2f}); GATING REMOVABLE: "
+                   f"run use_gate=False with damp_below_l={l_rec} (drops the low-l cap, keeps the Bragg shells).")
+    else:
+        verdict = ("high-l overlap collapses -> sharp broadband (non-Bragg) structure aliases the Bragg "
+                   "shells; gating or a forward-model background term is genuinely required, not removable.")
+    if verbose:
+        spark = _sparkline([max(per_shell[l]["overlap"], 0) for l in range(1, L_max + 1)])
+        print(f"\n angular power spectrum & per-shell A_dev overlap (at U_seed)")
+        print(f"   {'l':>2} | {'obs/iso':>8} | {'obs/pred':>8} | {'overlap':>8}")
+        for l in range(1, L_max + 1):
+            d = per_shell[l]
+            print(f"   {l:>2} | {d['obs_over_iso']:>8.1f} | {d['obs_over_pred']:>8.2f} | {d['overlap']:>+8.2f}")
+        print(f"   overlap vs l: {spark}")
+        print(f"   => {verdict}")
+    return {"available": True, "per_shell": per_shell, "l_min_recommended": l_rec,
+            "mean_overlap_high_l": mean_hi, "gating_removable": removable, "verdict": verdict}
+
 def orientation_acceptance(q_unit, cell, U, cos_gate=0.9999, h_max=8, d_min=4.0,
                            d_max=10.0, structure_factors=None, n_null=60000,
                            n_random=16, max_events=120000, seed=0,

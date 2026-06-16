@@ -372,6 +372,7 @@ class TestBinghamTracker(BaseTrackerTest):
             streaming_callback=streaming_callback,
             L_max=8,
             lorentz_correction=False,
+            damp_below_l=4,
         )
 
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)

@@ -115,7 +115,7 @@ def predict_all_shells_q_space(
 def kalman_subspace_update(
     P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
     w_l_j, ki_batch, U_base, process_q_scale, dt, ridge_inflation, meas_noise_1st,
-    meas_weight_2nd, num_events, L_max, low_l_damp,
+    meas_weight_2nd, num_events, L_max, low_l_damp, damp_below_l,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k
 ):
     """Consumes precomputed WEIGHTED sufficient statistics (A_lab_all,
@@ -132,9 +132,8 @@ def kalman_subspace_update(
         A_sample_dev = A_sample_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
-        # Suppress the dipole shell (lobe lives here; centrosymmetric signal does not).
-        if l == 1:
-            sigma_l = sigma_l * low_l_damp
+        # Suppress the low shells where the cap / smooth background lives.
+        sigma_l = jnp.where(l < damp_below_l, sigma_l * low_l_damp, sigma_l)
 
         z_1st_norm = Y_sample_all_sum[start:end] / num_events
         z_data_list.append(z_1st_norm)
@@ -182,6 +181,7 @@ def process_chunk_field_kalman(
     current_q_scale,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k,
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
+    use_gate=True, damp_below_l=2,
 ):
     # NOTE: q_batch is in the SAMPLE frame (loader output).
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
@@ -193,15 +193,14 @@ def process_chunk_field_kalman(
     Y_events_sample = e3x.so3.irreps.spherical_harmonics(
         q_batch, max_degree=L_max, cartesian_order=False, normalization="orthonormal")
 
-    # --- event-level signal gate -------------------------------------------------
-    # Soft proximity of each (unit) event direction to the nearest predicted
-    # Bragg direction. Discrimination scales with how sparsely the active
-    # reflections tile the sphere -- best with the correct narrow bandpass.
-    q_pred = U_base @ q_theo_sample_jax            # (3, M); columns are unit vectors
-    cos_sim = q_batch @ q_pred                     # (N, M)
-    nn_cos = jnp.max(cos_sim, axis=1)              # (N,)
-    w = jax.nn.sigmoid((nn_cos - cos_gate) / gate_temp)  # (N,) in [0, 1]
- 
+    # --- event-level signal gate (optional) ---
+    if use_gate:
+        q_pred = U_base @ q_theo_sample_jax
+        nn_cos = jnp.max(q_batch @ q_pred, axis=1)
+        w = jax.nn.sigmoid((nn_cos - cos_gate) / gate_temp)
+    else:
+        w = jnp.ones(q_batch.shape[0])          # purely directional: every event, no selection
+
     # WEIGHTED sufficient statistics (background suppressed in the moment itself).
     eff_count = jnp.maximum(jnp.sum(w), 1.0)
     Y_w = Y_events_sample * w[:, None]
@@ -211,7 +210,7 @@ def process_chunk_field_kalman(
     U_new, P_new, z_pred, z_data = kalman_subspace_update(
         P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
         w_l_j, ki_batch, U_base, current_q_scale, dt_chunk, ridge_inflation,
-        meas_noise_1st, meas_weight_2nd, num_events, L_max, low_l_damp,
+        meas_noise_1st, meas_weight_2nd, num_events, L_max, low_l_damp, damp_below_l,
         R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
         sigmoid_k
     )
@@ -250,7 +249,7 @@ def _tracker_loop_reference(
     gonio_axes=None, gonio_offsets=None,
     L_cov: int = 3, cov_ema_weight=0.1, cov_threshold_frac=0.3, cov_warmup_events=20000, sigmoid_k=12,
     q_scale_floor: float = 1e-5,
-    cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
+    cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6, use_gate=True, damp_below_l=2,
 ):
     import h5py
  
@@ -341,6 +340,7 @@ def _tracker_loop_reference(
             R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
             sigmoid_k,
             cos_gate, gate_temp, low_l_damp,
+            use_gate, damp_below_l,
         )
  
         U_curr.block_until_ready()
@@ -446,6 +446,8 @@ def tracker(
     cov_warmup_events: int = 20000,
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
     sigmoid_k = 10,
+    use_gate=False,
+    damp_below_l=3,
 ):
     from subhkl.optimization import FindUB
 
@@ -556,6 +558,7 @@ def tracker(
         L_cov, cov_ema_weight, cov_threshold_frac, cov_warmup_events, sigmoid_k,
         q_scale_floor,
         cos_gate, gate_temp, low_l_damp,
+        use_gate, damp_below_l,
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
