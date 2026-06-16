@@ -250,6 +250,7 @@ def _tracker_loop_reference(
     L_cov: int = 3, cov_ema_weight=0.1, cov_threshold_frac=0.3, cov_warmup_events=20000, sigmoid_k=12,
     q_scale_floor: float = 1e-5,
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6, use_gate=True, damp_below_l=2,
+    use_coverage_mask=True,
 ):
     import h5py
  
@@ -314,7 +315,7 @@ def _tracker_loop_reference(
             # what makes the mask inert for full coverage (no acquisition
             # penalty) AND flat across a partial cap (no internal ell=1 ramp).
             cov_scale_val = max(cov_threshold_frac * med, 1e-6)
-            use_cov_flag = 1.0
+            use_cov_flag = 1.0 if use_coverage_mask else 0.0
         else:
             use_cov_flag = 0.0 
 
@@ -467,6 +468,7 @@ def tracker(
     sigmoid_k = 10,
     use_gate=False,
     damp_below_l=3,
+    use_coverage_mask=True,
 ):
     from subhkl.optimization import FindUB
 
@@ -578,6 +580,7 @@ def tracker(
         q_scale_floor,
         cos_gate, gate_temp, low_l_damp,
         use_gate, damp_below_l,
+        use_coverage_mask,
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
