@@ -268,6 +268,7 @@ def _tracker_loop_reference(
     cov_coeffs_np = np.zeros(n_cov, dtype=np.float32)
     cov_scale_val = 1.0
     coverage_ready = False
+    events_seen = 0
  
     tracking_history = [(0.0, np.array(U_curr))]
  
@@ -278,6 +279,8 @@ def _tracker_loop_reference(
             continue
  
         t_state = float(t_batch_np[-1])
+        events_seen += len(t_batch_np)   # NEW
+
  
         # ---- build the per-batch sample->lab rotation (host-side) ----
         if has_gonio and angles_np is not None and np.size(angles_np) > 0:
@@ -298,7 +301,7 @@ def _tracker_loop_reference(
         batch_coeffs = Y_cov_obs.mean(axis=0)
         cov_coeffs_np = (1.0 - cov_ema_weight) * cov_coeffs_np + cov_ema_weight * batch_coeffs
  
-        if cumulative_count >= cov_warmup_events:
+        if events_seen >= cov_warmup_events:
             coverage_ready = True
  
         if coverage_ready:
@@ -314,6 +317,22 @@ def _tracker_loop_reference(
             use_cov_flag = 1.0
         else:
             use_cov_flag = 0.0 
+
+        # Do not move U until the coverage map is representative. During warmup
+        # vis==1 (full-sphere) OR the map is unrepresentative (panel ramp / mid-
+        # stream resume); against cap-confined data that is a coverage-shaped
+        # innovation that rotates U off a correct seed.
+        if not coverage_ready:
+            tracking_history.append((t_state, np.array(U_curr)))
+            if streaming_callback is not None:
+                new_events = {"banks": banks_np, "pixel_r": pr_np, "pixel_c": pc_np,
+                              "angles": angles_np, "s_lab": slab_np}
+                streaming_callback(time=t_state, U_preds=np.expand_dims(np.array(U_curr), 0),
+                                   losses=np.array([0.0]), best_idx=0,
+                                   neutron_count=cumulative_count, new_events=new_events,
+                                   metrics={"loss": 0.0, "eigengap": 0.0, "sig_rate": 0.0,
+                                            "bg_rate": 0.0, "coverage_ready": False})
+            continue
 
         # ---- device transfers (all traced inputs, no recompile on value change) ----
         q_batch = jax.device_put(q_batch_np)
