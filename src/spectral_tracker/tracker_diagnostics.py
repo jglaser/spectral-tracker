@@ -309,66 +309,6 @@ def angular_power_spectrum(rep, U_seed, structure_factors=None, lorentz=True, ph
     return {"available": True, "per_shell": per_shell, "l_min_recommended": l_rec,
             "mean_overlap_high_l": mean_hi, "gating_removable": removable, "verdict": verdict}
 
-def orientation_acceptance(q_unit, cell, U, cos_gate=0.9999, h_max=8, d_min=4.0,
-                           d_max=10.0, structure_factors=None, n_null=60000,
-                           n_random=16, max_events=120000, seed=0,
-                           label="U", verbose=True):
-    """contrast = observed_acceptance(U) / null_acceptance(U), null = uniform fill
-    of the observed footprint. >>1 => events concentrate on U's reflections beyond
-    cap-fill (orientation correct). ~1 => only filling the cap (wrong, OR pool too
-    dense to discriminate -- check spacing vs cone)."""
-    if sl is None:
-        return {"available": False, "reason": "spectrum_learning not importable"}
-    if U is None or cell is None:
-        return {"available": False, "reason": "needs cell + U"}
-    rng = np.random.default_rng(seed)
-    q_unit = np.asarray(q_unit, float)
-    if len(q_unit) > max_events:
-        q_unit = q_unit[rng.choice(len(q_unit), max_events, replace=False)]
-    pred = _pool_dirs(cell, U, h_max, d_min, d_max, structure_factors)
-    if len(pred) < 8:
-        return {"available": False, "reason": f"only {len(pred)} reflections in pool"}
-    spacing = _pool_spacing_deg(pred)
-    cone = float(np.degrees(np.arccos(np.clip(cos_gate, -1, 1))))
-    null = _uniform_in_footprint(q_unit, n_null, rng)
-    null_acc = _gate_acceptance(null, pred, cos_gate)
-    obs_acc = _gate_acceptance(q_unit, pred, cos_gate)
-    contrast = obs_acc / max(null_acc, 1e-9)
-
-    rc = []
-    for _ in range(n_random):
-        a = rng.normal(size=3); a /= np.linalg.norm(a); th = rng.uniform(0, np.pi)
-        Ksk = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
-        R = np.eye(3) + np.sin(th) * Ksk + (1 - np.cos(th)) * Ksk @ Ksk
-        Pr = _pool_dirs(cell, R @ np.asarray(U, float), h_max, d_min, d_max, structure_factors)
-        rc.append(_gate_acceptance(q_unit, Pr, cos_gate) / max(null_acc, 1e-9))
-    rc = np.array(rc); rc_mean, rc_max = float(rc.mean()), float(rc.max())
-
-    too_dense = spacing < cone
-    if too_dense:
-        verdict = (f"POOL TOO DENSE: spacing {spacing:.2f} < cone {cone:.2f} deg -> predictions "
-                   f"blanket the footprint; no metric discriminates. Raise d_min / lower h_max "
-                   f"or tighten cos_gate until cone < spacing. (This is your lock failure.)")
-    elif contrast > 3.0 and contrast > 2.0 * rc_max:
-        verdict = (f"orientation CORRECT & discriminable: {contrast:.1f}x over cap-fill "
-                   f"(random orientations only {rc_max:.1f}x).")
-    elif contrast > 1.5:
-        verdict = f"weak concentration ({contrast:.1f}x); sparsen pool / tighten gate."
-    else:
-        verdict = (f"NO concentration beyond cap-fill ({contrast:.1f}x ~ random {rc_mean:.1f}x): "
-                   f"wrong orientation OR no Bragg signal in this band.")
-    if verbose:
-        print(f"\n gate-acceptance orientation test [{label}]  (cos_gate={cos_gate}, cone={cone:.2f} deg)")
-        print(f"   pool {len(pred)} refl, mean NN spacing {spacing:.2f} deg "
-              f"({'cone<spacing OK' if not too_dense else 'TOO DENSE'})")
-        print(f"   observed {obs_acc:.4f} | footprint-null {null_acc:.4f} | CONTRAST {contrast:.2f}x")
-        print(f"   random-orientation contrast: mean {rc_mean:.2f}x  max {rc_max:.2f}x")
-        print(f"   => {verdict}")
-    return {"available": True, "contrast": contrast, "obs_acc": obs_acc, "null_acc": null_acc,
-            "spacing_deg": spacing, "cone_deg": cone, "too_dense": too_dense,
-            "random_contrast_mean": rc_mean, "random_contrast_max": rc_max,
-            "n_pool": len(pred), "verdict": verdict}
-
 def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
                     wl_band, structure_factors, family, cos_min, geom_fn, lorentz=True):
     """
@@ -501,89 +441,6 @@ def _footprint_mask(test_dirs, observed_dirs, n_grid=768):
     occ = np.zeros(n_grid, bool)
     occ[np.unique(tree.query(np.asarray(observed_dirs, float), k=1)[1])] = True
     return occ[tree.query(np.asarray(test_dirs, float), k=1)[1]]
-
-def _orientation_match_block(q_unit, ki_mean, cell, U_est, L_max, h_max,
-                             d_min, d_max, wl_band, structure_factors,
-                             lorentz, phi=None, coverage_mask=True, n_grid=768):
-    """At the SEED, build predicted shell moments the way the tracker weights them
-    and compare to OBSERVED moments via per-shell Frobenius overlap of A_dev.
-    coverage_mask restricts predicted reflections to the observed detector
-    footprint, so the comparison is on the same solid angle (without it the
-    predicted tensor is set by reflections you never see, which alone can drive
-    the overlap to 0 even at a correct seed)."""
-    if sl is None or U_est is None or cell is None:
-        return {"available": False, "reason": "needs cell + U_est"}
-
-    B = sl.reciprocal_B(*cell)
-    hv = np.arange(-h_max, h_max + 1)
-    H, K, L = np.meshgrid(hv, hv, hv, indexing="ij")
-    hkl = np.stack([H.ravel(), K.ravel(), L.ravel()])
-    hkl = hkl[:, ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))]
-    q_theo = B @ hkl
-    qn = np.linalg.norm(q_theo, axis=0)
-    res = (qn > 1.0 / d_max) & (qn < 1.0 / d_min)
-    hkl, q_theo, qn = hkl[:, res], q_theo[:, res], qn[res]
-    if hkl.shape[1] < 8:
-        return {"available": False, "reason": f"only {hkl.shape[1]} reflections in d-range"}
-
-    lam, _ = sl.bragg_wavelengths(q_theo, U_est, ki_mean)
-    finite = np.isfinite(lam) & (lam > 0)
-    if wl_band is None:
-        fl = lam[finite]
-        wl_band = (max(0.1, float(np.percentile(fl, 1))), float(np.percentile(fl, 99)))
-    in_band = finite & (lam > wl_band[0]) & (lam < wl_band[1])
-    if int(in_band.sum()) < 8:
-        return {"available": False, "reason": f"only {int(in_band.sum())} in-band reflections"}
-
-    qhat = q_theo / np.where(qn == 0, 1.0, qn)
-    pred = (np.asarray(U_est, float) @ qhat).T          # (M,3) unit, sample frame
-
-    imap = _intensity_lookup(structure_factors)
-    if imap is not None:
-        I = np.array([imap.get((int(h), int(k), int(l)),
-                               imap.get((-int(h), -int(k), -int(l)), 0.01))
-                      for h, k, l in hkl.T], float)
-        I = np.where(I > 0, I, 0.01)
-    else:
-        I = np.ones(hkl.shape[1])
-    Lf = (np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 1.0)
-          if lorentz else np.ones(hkl.shape[1]))
-    if phi is not None:
-        spec = np.asarray(phi(lam), float)
-        spec = np.where(np.isfinite(spec) & (spec > 0), spec, 0.0)
-    else:
-        spec = np.ones(hkl.shape[1])
-
-    p = np.where(in_band, 1.0, 0.0) * I * Lf * spec
-    p = np.clip(p, 0.0, None)
-    mask = in_band & (p > 0)
-    n_full = int(mask.sum())
-    if coverage_mask:
-        mask = mask & _footprint_mask(pred, q_unit, n_grid)
-    if int(mask.sum()) < 8:
-        return {"available": False,
-                "reason": f"only {int(mask.sum())} in-band+in-footprint reflections"}
-
-    obs_t = _adev_tensors(q_unit, L_max)                  # uniform over events
-    pred_t = _adev_tensors(pred[mask], L_max, p[mask])    # population-weighted
-
-    per_shell = {}
-    for l in range(1, L_max + 1):
-        Ao, Ap = obs_t[l], pred_t[l]
-        no = float(np.linalg.norm(Ao)); npd = float(np.linalg.norm(Ap))
-        ov = float(np.sum(Ao * Ap) / (no * npd)) if (no > 0 and npd > 0) else float("nan")
-        per_shell[l] = {"obs": no, "pred": npd, "overlap": ov}
-
-    ov2 = [per_shell[l]["overlap"] for l in range(2, L_max + 1)
-           if np.isfinite(per_shell[l]["overlap"])]
-    return {"available": True, "per_shell": per_shell,
-            "mean_overlap_l2": float(np.mean(ov2)) if ov2 else float("nan"),
-            "n_pred": int(mask.sum()), "n_pred_full": n_full,
-            "coverage_masked": bool(coverage_mask),
-            "wl_band": (float(wl_band[0]), float(wl_band[1])),
-            "d_range": (float(d_min), float(d_max)),
-            "weighted_phi": phi is not None, "lorentz": bool(lorentz),
-            "weighted_I": imap is not None}
 
 def _rand_rotations(n, rng):
     q = rng.normal(size=(n, 4)); q /= np.linalg.norm(q, axis=1, keepdims=True)
@@ -719,8 +576,6 @@ def orientation_scan(rep, U_seed, structure_factors=None, lorentz=True, phi="aut
         print(f"   best overlap (l>=2)  = {best:.3f}   at angle(R) = {ang:.1f} deg from identity")
         print(f"   per-shell @ best: " + " ".join(f"l{l}:{per_shell[l]:+.2f}" for l in sorted(per_shell)))
         print(f"   => {verdict}")
-        print("   [warning] A_dev-overlap objective is cap-dominated under anisotropic")
-        print("             background; cross-check with orientation_acceptance().")
     return {"best_R": best_R, "best_overlap": best, "seed_overlap": seed_ov,
             "angle_deg": ang, "per_shell": per_shell, "verdict": verdict}
 
@@ -826,22 +681,6 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         q_unit, ki_mean, cell, U_est, h_max, d_min, d_max, wl_band,
         structure_factors, spectrum_family, cos_min, geom_fn, lorentz)
 
-    orient_match = _orientation_match_block(
-        q_unit, ki_mean, cell, U_est, L_max, h_max, d_min, d_max,
-        (spectrum.get("wl_band") if spectrum.get("available") else wl_band),
-        structure_factors, lorentz,
-        phi=(spectrum.get("phi") if spectrum.get("available") else None),
-        coverage_mask=True)
-
-    orient_accept = orientation_acceptance(
-        q_unit, cell, U_est,
-        cos_gate=accept_cos_gate,
-        h_max=(accept_h_max or h_max),
-        d_min=(accept_d_min or max(d_min, 4.0)),   # default to a SPARSE pool
-        d_max=d_max, structure_factors=structure_factors,
-        label=label or "U_est", verbose=False) if (cell is not None and U_est is not None) \
-        else {"available": False, "reason": "needs cell + U_est"}
-
     _ss = np.random.default_rng(0).choice(N, size=min(N, 100_000), replace=False)
     rep_scan = {"q_unit": q_unit[_ss], "ki_mean": ki_mean, "cell": cell}
 
@@ -861,8 +700,6 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
         z_ratio=z_ratio, adev_ratio=adev_ratio,
         z_norm=z_norm, adev_norm=adev_norm, L_max=L_max,
         spectrum=spectrum,
-        orientation_match=orient_match,
-        orientation_acceptance=orient_accept,
         _scan=rep_scan,
     )
     _print_report(rep)
@@ -923,41 +760,6 @@ def _print_report(r):
             if not sp['divided_I']:
                 print("   note: no |F|^2 supplied -> curve is spectrum x structure (pass "
                       "structure_factors to deconvolve)")
-
-    om = r.get('orientation_match')
-    if om is not None:
-        print(f"\n seed orientation match (predicted vs observed A_dev at U_est)")
-        if not om.get("available"):
-            print(f"   [skipped] {om.get('reason')}")
-        else:
-            dlo, dhi = om["d_range"]; wlo, whi = om["wl_band"]
-            print(f"   pool d=[{dlo:.2f},{dhi:.2f}] A  lambda=[{wlo:.2f},{whi:.2f}] A  "
-                  f"({om['n_pred']} in-band refl) <- set to your TRACKER's d_min/d_max/wl")
-            print(f"   weights: phi={'Y' if om['weighted_phi'] else 'N'} "
-                  f"|F|2={'Y' if om['weighted_I'] else 'N'} lorentz={'Y' if om['lorentz'] else 'N'}")
-            print(f"   {'l':>2} | {'||A_dev|| obs':>13} | {'||A_dev|| pred':>14} | {'overlap':>8}")
-            for l in sorted(om["per_shell"]):
-                d = om["per_shell"][l]
-                flag = ("  <- aligned" if (l >= 2 and d["overlap"] > 0.8) else
-                        "  <- MISMATCH" if (l >= 2 and d["overlap"] < 0.5) else "")
-                print(f"   {l:>2} | {d['obs']:>13.3f} | {d['pred']:>14.3f} | {d['overlap']:>8.3f}{flag}")
-            mo = om["mean_overlap_l2"]
-            verdict = ("seed is a true minimum -> debug optimizer/annealing" if mo > 0.8 else
-                       "prediction != observation at seed -> model (d-range/band/spectrum) mismatch"
-                       if mo < 0.5 else "marginal -> tighten d-range/band to the data")
-            print(f"   mean overlap (l>=2) = {mo:.3f}  <- {verdict}")
-
-    oa = r.get('orientation_acceptance')
-    if oa is not None and oa.get("available"):
-        print(f"\n gate-acceptance orientation test (footprint-null normalized)")
-        print(f"   pool {oa['n_pool']} refl, NN spacing {oa['spacing_deg']:.2f} deg vs gate cone {oa['cone_deg']:.2f} deg")
-        print(f"   CONTRAST {oa['contrast']:.2f}x  (random orientations {oa['random_contrast_mean']:.2f}x) "
-              f"<- THIS is the orientation verdict, not A_dev overlap")
-        print(f"   => {oa['verdict']}")
-    if r.get('clustering_top10_lab', 1.0) < 0.4 and r.get('orientation_match', {}).get('available'):
-        print("   NOTE: background is diffuse/cap-like -> the A_dev overlap verdict above is "
-              "unreliable; defer to the gate-acceptance contrast.")
-
 
 def compare(a, b):
     """Side-by-side of the discriminating scalars + per-shell A_dev ratios."""
