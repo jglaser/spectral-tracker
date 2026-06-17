@@ -90,10 +90,10 @@ def predict_all_shells_q_space(
     nn_cell = jnp.argmax(jnp.matmul(q_lab_pred, grid.T), axis=1) # nearest frozen cell
     vis = occ_mask[nn_cell]                                      # {0,1}, hard footprint
     vis = jnp.where(use_coverage > 0.5, vis, jnp.ones_like(vis))
-    vis = jax.lax.stop_gradient(vis)
+    #vis = jax.lax.stop_gradient(vis)
 
     weight = ewald_window * vis
-    total_window_mass = jnp.maximum(jnp.sum(weight), 1.0)
+    total_window_mass = jnp.maximum(jnp.sum(weight), 1e-6)
 
     preds = []
     for l in range(1, L_max + 1):
