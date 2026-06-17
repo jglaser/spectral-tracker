@@ -217,13 +217,13 @@ def _uniform_in_footprint(observed_dirs, n, rng, n_grid=768):
 
 def angular_power_spectrum(rep, U_seed, structure_factors=None, lorentz=True, phi="auto",
                            L_max=8, h_max=8, d_min=2.0, d_max=10.0, wl_band="auto",
-                           coverage_mask=True, n_grid=768, overlap_thr=0.45, verbose=True):
-    """Per-shell angular power of OBSERVED events vs the U_seed Bragg model, and
-    their per-shell A_dev overlap. Decides whether orientation is recoverable
-    WITHOUT gating: smooth background (cap, broad diffuse) lives at low l, so the
-    overlap stays high at high l (drop low l, run ungated); sharp broadband
-    background (blobs/rings) collapses the high-l overlap (gating or a background
-    model is genuinely required). Grounded on the verified seed, not a scan."""
+                           coverage_mask=True, n_grid=768, overlap_thr=0.45,
+                           L_cov=3, sigmoid_k=10, cov_threshold_frac=0.3, verbose=True):
+    """Per-shell A_dev overlap of OBSERVED events vs the U_seed Bragg model under
+    THREE predicted-pool weightings: no mask, the hard detector footprint, and the
+    SH-vis reconstruction the tracker actually uses. The hard-vs-SH gap at the seed
+    is the bias the Kalman descends. (coverage_mask kept for call compatibility;
+    all three are always reported.)"""
     ctx = rep["_scan"]
     q_unit, ki_mean, cell = ctx["q_unit"], ctx["ki_mean"], ctx["cell"]
     if phi == "auto":
@@ -259,55 +259,68 @@ def angular_power_spectrum(rep, U_seed, structure_factors=None, lorentz=True, ph
     if phi is not None:
         s = np.asarray(phi(lam), float); spec = np.where(np.isfinite(s) & (s > 0), s, 0.0)
     p = np.clip(np.where(in_band, 1.0, 0.0) * I * Lf * spec, 0.0, None)
-    mask = in_band & (p > 0)
-    if coverage_mask:
-        mask = mask & _footprint_mask(pred, q_unit, n_grid)
-    if int(mask.sum()) < 8:
-        return {"available": False, "reason": f"only {int(mask.sum())} in-band+footprint refl"}
+    in_pool = in_band & (p > 0)
+    if int(in_pool.sum()) < 8:
+        return {"available": False, "reason": f"only {int(in_pool.sum())} in-band refl"}
+
+    # --- the three masks ---
+    foot = _footprint_mask(pred, q_unit, n_grid).astype(float)          # hard detector footprint
+    Yc_obs = np.asarray(e3x.so3.irreps.spherical_harmonics(
+        jnp.asarray(q_unit, jnp.float32), max_degree=L_cov, cartesian_order=False,
+        normalization="orthonormal"))
+    Yc_pred = np.asarray(e3x.so3.irreps.spherical_harmonics(
+        jnp.asarray(pred, jnp.float32), max_degree=L_cov, cartesian_order=False,
+        normalization="orthonormal"))
+    cov_coeffs = Yc_obs.mean(axis=0)
+    C_obs, C_pred = Yc_obs @ cov_coeffs, Yc_pred @ cov_coeffs
+    med = float(np.median(C_obs[C_obs > 1e-9])) if np.any(C_obs > 1e-9) else 1.0
+    cov_scale = max(cov_threshold_frac * med, 1e-6)
+    vis = 1.0 / (1.0 + np.exp(-sigmoid_k * (C_pred / cov_scale - 1.0)))   # SH-vis, tracker formula
+
+    w0 = np.where(in_pool, p, 0.0)
+    weights = {"none": w0, "hard": w0 * foot, "SH": w0 * vis}
 
     obs_t = _adev_tensors(q_unit, L_max)
-    pred_t = _adev_tensors(pred[mask], L_max, p[mask])
+    pt = {m: _adev_tensors(pred, L_max, w) for m, w in weights.items()}
     rng = np.random.default_rng(0)
-    iso = _adev_tensors(rng.normal(size=(min(len(q_unit), 100000), 3)) /
-                        np.linalg.norm(rng.normal(size=(min(len(q_unit), 100000), 3)), axis=1, keepdims=True), L_max)
+    iso = _adev_tensors(_unit(rng.normal(size=(min(len(q_unit), 100000), 3))), L_max)
 
-    per_shell = {}
+    per_shell, ov = {}, {m: [] for m in weights}
     for l in range(1, L_max + 1):
-        Ao, Ap, Ai = obs_t[l], pred_t[l], iso[l]
-        no, npd, ni = (float(np.linalg.norm(Ao)), float(np.linalg.norm(Ap)),
-                       float(np.linalg.norm(Ai)) + 1e-12)
-        ov = float(np.sum(Ao * Ap) / (no * npd)) if (no > 0 and npd > 0) else float("nan")
-        per_shell[l] = {"obs": no, "pred": npd, "obs_over_iso": no / ni,
-                        "obs_over_pred": (no / npd if npd > 0 else float("nan")), "overlap": ov}
+        Ao, Ai = obs_t[l], iso[l]; no = float(np.linalg.norm(Ao)); ni = float(np.linalg.norm(Ai)) + 1e-12
+        row = {"obs_over_iso": no / ni}
+        for m in weights:
+            Ap = pt[m][l]; npd = float(np.linalg.norm(Ap))
+            o = float(np.sum(Ao * Ap) / (no * npd)) if (no > 0 and npd > 0) else float("nan")
+            row[f"overlap_{m}"] = o
+            if l >= 2 and np.isfinite(o): ov[m].append(o)
+        per_shell[l] = row
+    mean_ov = {m: (float(np.mean(v)) if v else float("nan")) for m, v in ov.items()}
 
-    # recommended l_min: smallest l>=2 from which overlap stays above threshold
-    l_rec = None
-    for l in range(2, L_max + 1):
-        if all(per_shell[k]["overlap"] > overlap_thr for k in range(l, L_max + 1)
-               if np.isfinite(per_shell[k]["overlap"])):
-            l_rec = l; break
-    hi = [per_shell[l]["overlap"] for l in range((l_rec or L_max), L_max + 1)
-          if np.isfinite(per_shell[l]["overlap"])]
-    mean_hi = float(np.mean(hi)) if hi else float("nan")
-    removable = (l_rec is not None) and (mean_hi > overlap_thr)
-
-    if removable:
-        verdict = (f"orientation lives in l>={l_rec} (mean overlap {mean_hi:+.2f}); GATING REMOVABLE: "
-                   f"run use_gate=False with damp_below_l={l_rec} (drops the low-l cap, keeps the Bragg shells).")
+    gap = mean_ov["hard"] - mean_ov["SH"]
+    if mean_ov["hard"] > overlap_thr and gap > 0.15:
+        verdict = (f"HARD footprint recovers the seed (mean l>=2 overlap {mean_ov['hard']:+.2f}) but "
+                   f"SH-vis loses {gap:+.2f} of it (SH={mean_ov['SH']:+.2f}) -> the SH coverage "
+                   f"reconstruction is the bias source; replace vis with the hard footprint.")
+    elif mean_ov["hard"] > overlap_thr:
+        verdict = (f"hard and SH agree (hard={mean_ov['hard']:+.2f}, SH={mean_ov['SH']:+.2f}); the "
+                   f"mask is not the bottleneck -- look elsewhere (gradient-through-coverage, spectrum).")
     else:
-        verdict = ("high-l overlap collapses -> sharp broadband (non-Bragg) structure aliases the Bragg "
-                   "shells; gating or a forward-model background term is genuinely required, not removable.")
+        verdict = (f"even the hard footprint is low ({mean_ov['hard']:+.2f}) -> not a mask problem; "
+                   f"broadband non-Bragg structure or wrong band/cell.")
     if verbose:
-        spark = _sparkline([max(per_shell[l]["overlap"], 0) for l in range(1, L_max + 1)])
+        cov_sh = float((vis[in_pool] > 0.5).mean()); cov_hd = float(foot[in_pool].mean())
         print(f"\n angular power spectrum & per-shell A_dev overlap (at U_seed)")
-        print(f"   {'l':>2} | {'obs/iso':>8} | {'obs/pred':>8} | {'overlap':>8}")
+        print(f"   {'l':>2} | {'obs/iso':>8} | {'ov(none)':>8} | {'ov(hard)':>8} | {'ov(SH)':>8}")
         for l in range(1, L_max + 1):
             d = per_shell[l]
-            print(f"   {l:>2} | {d['obs_over_iso']:>8.1f} | {d['obs_over_pred']:>8.2f} | {d['overlap']:>+8.2f}")
-        print(f"   overlap vs l: {spark}")
+            print(f"   {l:>2} | {d['obs_over_iso']:>8.1f} | {d['overlap_none']:>+8.2f} | "
+                  f"{d['overlap_hard']:>+8.2f} | {d['overlap_SH']:>+8.2f}")
+        print(f"   mean l>=2:  none {mean_ov['none']:+.2f} | hard {mean_ov['hard']:+.2f} | SH {mean_ov['SH']:+.2f}")
+        print(f"   pool kept:  hard {100*cov_hd:.0f}% | SH(>0.5) {100*cov_sh:.0f}%  (of in-band refl)")
         print(f"   => {verdict}")
-    return {"available": True, "per_shell": per_shell, "l_min_recommended": l_rec,
-            "mean_overlap_high_l": mean_hi, "gating_removable": removable, "verdict": verdict}
+    return {"available": True, "per_shell": per_shell, "mean_overlap": mean_ov,
+            "hard_minus_sh": gap, "verdict": verdict}
 
 def _spectrum_block(q_unit, ki_mean, cell, U_est, h_max, d_min, d_max,
                     wl_band, structure_factors, family, cos_min, geom_fn, lorentz=True):
