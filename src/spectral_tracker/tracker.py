@@ -86,6 +86,7 @@ def predict_all_shells_q_space(
     vis = jax.nn.sigmoid(sigmoid_k*(C/cov_scale - 1.0))
     # Warm-up (no coverage estimate yet) -> vis == 1 (full-sphere behaviour).
     vis = jnp.where(use_coverage > 0.5, vis, jnp.ones_like(vis))
+    vis = jax.lax.stop_gradient(vis)   # coverage is fixed per batch, not an orientation DOF
 
     weight = ewald_window * vis
     total_window_mass = jnp.maximum(jnp.sum(weight), 1.0)
