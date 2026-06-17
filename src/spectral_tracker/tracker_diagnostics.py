@@ -718,6 +718,111 @@ def analyze_event_stream(event_batches, gonio_axes=None, gonio_offsets=None,
     _print_report(rep)
     return rep
 
+def _moment_vec(dirs, L_max, weights=None):
+    """Stacked [z_1st, A_dev.flatten()] per shell l=1..L_max, TRUE weighted
+    average (matches the patched forward model)."""
+    Y = np.asarray(e3x.so3.irreps.spherical_harmonics(
+        jnp.asarray(dirs, jnp.float32), max_degree=L_max,
+        cartesian_order=False, normalization="orthonormal"))
+    w = np.ones(Y.shape[0]) if weights is None else np.asarray(weights, float)
+    wsum = float(w.sum()) + 1e-12
+    parts = []
+    for l in range(1, L_max + 1):
+        s, e, dim = l * l, (l + 1) * (l + 1), 2 * l + 1
+        Yl = Y[:, s:e]
+        z1 = (Yl * w[:, None]).sum(0) / wsum
+        A = (Yl.T * w) @ Yl / wsum * (4.0 * np.pi / dim)
+        Adev = A - np.trace(A) / dim * np.eye(dim)
+        parts.append(z1); parts.append(Adev.ravel())
+    return np.concatenate(parts)
+
+
+def seed_vs_random_innovation(rep, U_seed, structure_factors=None, phi="auto",
+                              L_max=8, h_max=8, d_min=2.0, d_max=10.0, wl_band="auto",
+                              coverage_mask=True, n_grid=768, n_rand=32, seed=0, verbose=True):
+    """Static landscape test: is U_seed a true minimum of ||z_data - z_pred||,
+    and under which population weighting? For each weighting, reports the seed's
+    innovation vs the random-orientation distribution. The seed is a genuine
+    minimum iff its innovation is below even the BEST random orientation
+    (margin = rand_min / seed > 1). Pick the weighting with the largest margin;
+    that is the objective whose minimum is at the truth."""
+    ctx = rep["_scan"]; q_unit, ki_mean, cell = ctx["q_unit"], ctx["ki_mean"], ctx["cell"]
+    if phi == "auto":
+        sp = rep.get("spectrum") or {}; phi = sp.get("phi") if sp.get("available") else None
+    if wl_band == "auto":
+        sp = rep.get("spectrum") or {}; wl_band = sp.get("wl_band") if sp.get("available") else None
+
+    B = sl.reciprocal_B(*cell)
+    hv = np.arange(-h_max, h_max + 1); H, K, L = np.meshgrid(hv, hv, hv, indexing="ij")
+    hkl = np.stack([H.ravel(), K.ravel(), L.ravel()])
+    hkl = hkl[:, ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))]
+    q_theo = B @ hkl; qn = np.linalg.norm(q_theo, axis=0)
+    res = (qn > 1.0 / d_max) & (qn < 1.0 / d_min)
+    hkl, q_theo, qn = hkl[:, res], q_theo[:, res], qn[res]
+    qhat = q_theo / np.where(qn == 0, 1.0, qn)
+    imap = _intensity_lookup(structure_factors)
+    if imap is not None:
+        Fsq = np.array([imap.get((int(h), int(k), int(l)),
+                                 imap.get((-int(h), -int(k), -int(l)), 0.01)) for h, k, l in hkl.T], float)
+        Fsq = np.where(Fsq > 0, Fsq, 0.01)
+    else:
+        Fsq = np.ones(hkl.shape[1])
+
+    obs_vec = _moment_vec(q_unit, L_max)                       # fixed, independent of U
+    # boolean over the stacked vector marking l>=2 entries
+    l2 = np.concatenate([np.full(2 * l + 1 + (2 * l + 1) ** 2, l >= 2) for l in range(1, L_max + 1)])
+
+    grid = _fibonacci_sphere(n_grid); gtree = cKDTree(grid)
+    occ = np.zeros(n_grid, bool); occ[np.unique(gtree.query(np.asarray(q_unit, float), k=1)[1])] = True
+
+    kinds = ["flat", "F2", "F2_lorentz"] + (["F2_lorentz_phi"] if phi is not None else [])
+
+    def innov(U, kind):
+        proj = np.asarray(ki_mean, float) @ (U @ qhat)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            lam = -2.0 * proj / np.where(qn == 0, np.nan, qn)
+        finite = np.isfinite(lam) & (lam > 0)
+        band = wl_band if wl_band is not None else (
+            max(0.1, float(np.percentile(lam[finite], 1))), float(np.percentile(lam[finite], 99)))
+        w = (finite & (lam > band[0]) & (lam < band[1])).astype(float)
+        if kind != "flat":
+            w = w * Fsq
+        if kind in ("F2_lorentz", "F2_lorentz_phi"):
+            w = w * np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 0.0)
+        if kind == "F2_lorentz_phi" and phi is not None:
+            s = np.asarray(phi(lam), float); w = w * np.where(np.isfinite(s) & (s > 0), s, 0.0)
+        pred = (U @ qhat).T
+        if coverage_mask:
+            w = w * occ[gtree.query(pred, k=1)[1]]
+        w = np.clip(w, 0.0, None)
+        if (w > 0).sum() < 8:
+            return np.nan
+        d = obs_vec - _moment_vec(pred, L_max, w)
+        return float(np.linalg.norm(d[l2]))                    # l>=2 innovation
+
+    rng = np.random.default_rng(seed)
+    Rs = _rand_rotations(n_rand, rng)
+    U_seed = np.asarray(U_seed, float)
+    rows = {}
+    for kind in kinds:
+        s = innov(U_seed, kind)
+        r = np.array([innov(R @ U_seed, kind) for R in Rs]); r = r[np.isfinite(r)]
+        rows[kind] = dict(seed=s, rand_med=float(np.median(r)) if r.size else np.nan,
+                          rand_min=float(np.min(r)) if r.size else np.nan,
+                          margin=(float(np.min(r)) / s) if (r.size and s and s > 0) else np.nan)
+    if verbose:
+        print(f"\n seed-vs-random innovation  ||z_data - z_pred||  (l>=2, coverage_mask={coverage_mask})")
+        print(f"   {'weighting':>16} | {'seed':>9} | {'rand med':>9} | {'rand min':>9} | {'margin':>7}")
+        for k, v in rows.items():
+            m = v["margin"]
+            flag = ("  TRUE MIN" if (np.isfinite(m) and m > 1.5) else
+                    "  weak"     if (np.isfinite(m) and m > 1.05) else "  NOT a min")
+            print(f"   {k:>16} | {v['seed']:>9.4f} | {v['rand_med']:>9.4f} | {v['rand_min']:>9.4f} | {m:>7.2f}{flag}")
+        print("   margin = rand_min / seed ; >1.5 => even the BEST random orientation is worse than truth")
+        best = max(rows, key=lambda k: (rows[k]["margin"] if np.isfinite(rows[k]["margin"]) else -1))
+        print(f"   => use weighting '{best}' (largest margin); if all margins ~1, the forward model")
+        print(f"      is degenerate at this normalization (flat landscape -> dead/indifferent filter).")
+    return rows
 
 def _print_report(r):
     print(f"\n{'='*64}\n EVENT-STREAM DIAGNOSTIC: {r['label']}\n{'='*64}")
