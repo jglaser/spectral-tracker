@@ -737,15 +737,30 @@ def _moment_vec(dirs, L_max, weights=None):
     return np.concatenate(parts)
 
 
-def seed_vs_random_innovation(rep, U_seed, structure_factors=None, phi="auto",
+def _shell_overlap_dist(obs_dirs, pred_dirs, L_max, w_obs, w_pred):
+    """Sum over l>=2 of (1 - cosine overlap) of per-shell A_dev. Scale-invariant:
+    tests DIRECTION agreement only, unlike the L2 innovation which also penalizes
+    magnitude mismatch between the N-normalized obs moment and the Sw-normalized
+    pred moment."""
+    Ao = _adev_tensors(obs_dirs, L_max, w_obs)
+    Ap = _adev_tensors(pred_dirs, L_max, w_pred)
+    d = 0.0
+    for l in range(2, L_max + 1):
+        no, npd = np.linalg.norm(Ao[l]), np.linalg.norm(Ap[l])
+        if no > 0 and npd > 0:
+            d += 1.0 - float(np.sum(Ao[l] * Ap[l]) / (no * npd))
+    return d
+
+def seed_vs_random_innovation(rep, U_seed, structure_factors=None, lorentz=True, phi="auto",
                               L_max=8, h_max=8, d_min=2.0, d_max=10.0, wl_band="auto",
                               coverage_mask=True, n_grid=768, n_rand=32, seed=0, verbose=True):
-    """Static landscape test: is U_seed a true minimum of ||z_data - z_pred||,
-    and under which population weighting? For each weighting, reports the seed's
-    innovation vs the random-orientation distribution. The seed is a genuine
-    minimum iff its innovation is below even the BEST random orientation
-    (margin = rand_min / seed > 1). Pick the weighting with the largest margin;
-    that is the objective whose minimum is at the truth."""
+    """Static landscape test, wired to the SAME footprint-masked, identically-
+    weighted predicted pool angular_power_spectrum uses for its ov(hard) column.
+    Reports per-orientation L2 innovation AND overlap-distance (1-cos of per-shell
+    A_dev), seed vs random. The seed is a true minimum iff its value is below the
+    best random orientation (margin = rand_min/seed > 1). Because the pool/weights
+    now match angular_power_spectrum exactly, the seed overlap here must reproduce
+    that diagnostic's ov(hard); any disagreement was a pool/weighting mismatch."""
     ctx = rep["_scan"]; q_unit, ki_mean, cell = ctx["q_unit"], ctx["ki_mean"], ctx["cell"]
     if phi == "auto":
         sp = rep.get("spectrum") or {}; phi = sp.get("phi") if sp.get("available") else None
@@ -768,60 +783,83 @@ def seed_vs_random_innovation(rep, U_seed, structure_factors=None, phi="auto",
     else:
         Fsq = np.ones(hkl.shape[1])
 
-    obs_vec = _moment_vec(q_unit, L_max)                       # fixed, independent of U
-    # boolean over the stacked vector marking l>=2 entries
-    l2 = np.concatenate([np.full(2 * l + 1 + (2 * l + 1) ** 2, l >= 2) for l in range(1, L_max + 1)])
+    # observed side: raw events, once. EXACTLY angular_power_spectrum's obs_t.
+    obs_t = _adev_tensors(q_unit, L_max)
 
+    # observed footprint occupancy (the hard mask, keyed on observed events) — built
+    # ONCE on the observed set, identical to _footprint_mask's grid/occ. Reused for
+    # every candidate U so the predicted pool is masked to the SAME solid angle.
     grid = _fibonacci_sphere(n_grid); gtree = cKDTree(grid)
     occ = np.zeros(n_grid, bool); occ[np.unique(gtree.query(np.asarray(q_unit, float), k=1)[1])] = True
 
     kinds = ["flat", "F2", "F2_lorentz"] + (["F2_lorentz_phi"] if phi is not None else [])
 
-    def innov(U, kind):
+    def _pred_pool(U, kind):
+        """Predicted dirs + weights, built the angular_power_spectrum way."""
         proj = np.asarray(ki_mean, float) @ (U @ qhat)
         with np.errstate(divide="ignore", invalid="ignore"):
             lam = -2.0 * proj / np.where(qn == 0, np.nan, qn)
         finite = np.isfinite(lam) & (lam > 0)
         band = wl_band if wl_band is not None else (
             max(0.1, float(np.percentile(lam[finite], 1))), float(np.percentile(lam[finite], 99)))
-        w = (finite & (lam > band[0]) & (lam < band[1])).astype(float)
-        if kind != "flat":
-            w = w * Fsq
-        if kind in ("F2_lorentz", "F2_lorentz_phi"):
-            w = w * np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 0.0)
+        in_band = finite & (lam > band[0]) & (lam < band[1])
+        I = np.ones(hkl.shape[1]) if kind == "flat" else Fsq
+        Lf = (np.where((qn > 0) & (lam > 0), 4.0 * (lam ** 2) / (qn ** 2), 1.0)
+              if kind in ("F2_lorentz", "F2_lorentz_phi") else np.ones(hkl.shape[1]))
+        spec = np.ones(hkl.shape[1])
         if kind == "F2_lorentz_phi" and phi is not None:
-            s = np.asarray(phi(lam), float); w = w * np.where(np.isfinite(s) & (s > 0), s, 0.0)
+            s = np.asarray(phi(lam), float); spec = np.where(np.isfinite(s) & (s > 0), s, 0.0)
+        p = np.clip(np.where(in_band, 1.0, 0.0) * I * Lf * spec, 0.0, None)
         pred = (U @ qhat).T
+        mask = (p > 0)
         if coverage_mask:
-            w = w * occ[gtree.query(pred, k=1)[1]]
-        w = np.clip(w, 0.0, None)
-        if (w > 0).sum() < 8:
-            return np.nan
-        d = obs_vec - _moment_vec(pred, L_max, w)
-        return float(np.linalg.norm(d[l2]))                    # l>=2 innovation
+            mask = mask & occ[gtree.query(pred, k=1)[1]]      # SAME hard footprint
+        return pred, np.where(mask, p, 0.0)
 
-    rng = np.random.default_rng(seed)
-    Rs = _rand_rotations(n_rand, rng)
+    def scores(U, kind):
+        pred, w = _pred_pool(U, kind)
+        if (w > 0).sum() < 8:
+            return np.nan, np.nan
+        pred_t = _adev_tensors(pred, L_max, w)                # SAME construction as ov(hard)
+        l2 = 0.0; ovd = 0.0
+        for l in range(2, L_max + 1):
+            Ao, Ap = obs_t[l], pred_t[l]
+            no, npd = np.linalg.norm(Ao), np.linalg.norm(Ap)
+            # L2 on UNIT-normalized tensors (scale-free), so it and overlap test the
+            # same direction-only objective the angular power spectrum reports.
+            if no > 0 and npd > 0:
+                l2 += float(np.linalg.norm(Ao / no - Ap / npd)) ** 2
+                ovd += 1.0 - float(np.sum(Ao * Ap) / (no * npd))
+        return float(np.sqrt(l2)), float(ovd)
+
+    rng = np.random.default_rng(seed); Rs = _rand_rotations(n_rand, rng)
     U_seed = np.asarray(U_seed, float)
     rows = {}
     for kind in kinds:
-        s = innov(U_seed, kind)
-        r = np.array([innov(R @ U_seed, kind) for R in Rs]); r = r[np.isfinite(r)]
-        rows[kind] = dict(seed=s, rand_med=float(np.median(r)) if r.size else np.nan,
-                          rand_min=float(np.min(r)) if r.size else np.nan,
-                          margin=(float(np.min(r)) / s) if (r.size and s and s > 0) else np.nan)
+        sl2, sov = scores(U_seed, kind)
+        rr = [scores(R @ U_seed, kind) for R in Rs]
+        rl2 = np.array([a for a, _ in rr]); rov = np.array([b for _, b in rr])
+        rl2 = rl2[np.isfinite(rl2)]; rov = rov[np.isfinite(rov)]
+        rows[kind] = dict(
+            seed_l2=sl2, seed_ov=sov,
+            rmin_l2=float(np.min(rl2)) if rl2.size else np.nan,
+            rmin_ov=float(np.min(rov)) if rov.size else np.nan,
+            margin_l2=(float(np.min(rl2)) / sl2) if (rl2.size and sl2 > 0) else np.nan,
+            margin_ov=(float(np.min(rov)) / sov) if (rov.size and sov > 0) else np.nan)
     if verbose:
-        print(f"\n seed-vs-random innovation  ||z_data - z_pred||  (l>=2, coverage_mask={coverage_mask})")
-        print(f"   {'weighting':>16} | {'seed':>9} | {'rand med':>9} | {'rand min':>9} | {'margin':>7}")
+        print(f"\n seed-vs-random (footprint-masked pool == angular_power_spectrum ov(hard); "
+              f"coverage_mask={coverage_mask})")
+        print(f"   {'weighting':>16} | {'seed L2':>8} | {'rmin L2':>8} | {'marg L2':>8} | "
+              f"{'seed ovd':>8} | {'rmin ovd':>8} | {'marg ovd':>8}")
         for k, v in rows.items():
-            m = v["margin"]
-            flag = ("  TRUE MIN" if (np.isfinite(m) and m > 1.5) else
-                    "  weak"     if (np.isfinite(m) and m > 1.05) else "  NOT a min")
-            print(f"   {k:>16} | {v['seed']:>9.4f} | {v['rand_med']:>9.4f} | {v['rand_min']:>9.4f} | {m:>7.2f}{flag}")
-        print("   margin = rand_min / seed ; >1.5 => even the BEST random orientation is worse than truth")
-        best = max(rows, key=lambda k: (rows[k]["margin"] if np.isfinite(rows[k]["margin"]) else -1))
-        print(f"   => use weighting '{best}' (largest margin); if all margins ~1, the forward model")
-        print(f"      is degenerate at this normalization (flat landscape -> dead/indifferent filter).")
+            f2 = "TRUE MIN" if v["margin_l2"] > 1.5 else "weak" if v["margin_l2"] > 1.05 else "NOT min"
+            fo = "TRUE MIN" if v["margin_ov"] > 1.5 else "weak" if v["margin_ov"] > 1.05 else "NOT min"
+            print(f"   {k:>16} | {v['seed_l2']:>8.4f} | {v['rmin_l2']:>8.4f} | {v['margin_l2']:>6.2f} {f2:>8} | "
+                  f"{v['seed_ov']:>8.4f} | {v['rmin_ov']:>8.4f} | {v['margin_ov']:>6.2f} {fo:>8}")
+        print("   margin = rand_min/seed; >1.5 => truth beats even the best random orientation.")
+        print("   NOTE: L2 is now on UNIT-normalized per-shell tensors (scale-free), matching the")
+        print("   overlap objective; if seed_ov here != angular_power_spectrum ov(hard), the pools")
+        print("   still differ (check structure_factors/lorentz/wl_band match between the two calls).")
     return rows
 
 def _print_report(r):
