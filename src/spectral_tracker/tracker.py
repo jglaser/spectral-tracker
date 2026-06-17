@@ -47,9 +47,7 @@ def _sample_to_lab_matrix(axes, rep_ang, offsets):
 # Forward model (renamed *_sample; adds lab-frame visibility mask).
 # ----------------------------------------------------------------------------
 def predict_all_shells_q_space(
-    omega, U_base, q_theo_sample_jax, I_weights_jax,
-    grid, occ_mask,
-    w_l_j, ki_batch, L_max,
+    omega, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k=10,
 ):
     """
@@ -85,12 +83,10 @@ def predict_all_shells_q_space(
         q_lab_pred, max_degree=L_cov, cartesian_order=False, normalization="orthonormal")
     C = jnp.matmul(Y_cov, cov_coeffs)                            # band-limited occupancy
 
-    # --- hard detector footprint, evaluated in the LAB frame, frozen w.r.t. omega ---
-    q_lab_pred = jnp.matmul(R_batch, q_sample.T).T               # (M,3)
-    nn_cell = jnp.argmax(jnp.matmul(q_lab_pred, grid.T), axis=1) # nearest frozen cell
-    vis = occ_mask[nn_cell]                                      # {0,1}, hard footprint
+    vis = jax.nn.sigmoid(sigmoid_k*(C/cov_scale - 1.0))
+    # Warm-up (no coverage estimate yet) -> vis == 1 (full-sphere behaviour).
     vis = jnp.where(use_coverage > 0.5, vis, jnp.ones_like(vis))
-    #vis = jax.lax.stop_gradient(vis)
+    vis = jax.lax.stop_gradient(vis)
 
     weight = ewald_window * vis
     total_window_mass = jnp.maximum(jnp.sum(weight), 1e-6)
@@ -119,7 +115,6 @@ def predict_all_shells_q_space(
 @partial(jax.jit, static_argnames=["L_max", "L_cov"])
 def kalman_subspace_update(
     P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
-    grid, occ_mask,
     w_l_j, ki_batch, U_base, process_q_scale, dt, ridge_inflation, meas_noise_1st,
     meas_weight_2nd, num_events, L_max, low_l_damp, damp_below_l,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k
@@ -154,9 +149,7 @@ def kalman_subspace_update(
     # Closure so jacfwd differentiates ONLY omega; coverage args held constant.
     def fwd(om):
         return predict_all_shells_q_space(
-            om, U_base, q_theo_sample_jax, I_weights_jax,
-            grid, occ_mask,
-            w_l_j, ki_batch, L_max,
+            om, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max,
             R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k)
 
     z_pred = fwd(omega_state)
@@ -185,7 +178,6 @@ def kalman_subspace_update(
 def process_chunk_field_kalman(
     P_prev, q_batch, ki_batch, t_batch,
     q_theo_sample_jax, w_l_j, I_weights_jax,
-    grid, occ_mask,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_base,
     current_q_scale,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k,
@@ -218,7 +210,6 @@ def process_chunk_field_kalman(
 
     U_new, P_new, z_pred, z_data = kalman_subspace_update(
         P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
-        grid, occ_mask,
         w_l_j, ki_batch, U_base, current_q_scale, dt_chunk, ridge_inflation,
         meas_noise_1st, meas_weight_2nd, num_events, L_max, low_l_damp, damp_below_l,
         R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
@@ -238,11 +229,6 @@ def process_chunk_field_kalman(
 
     return P_final, U_final, spectral_nll, sig_rate, bg_rate
 
-def _fibonacci_sphere_np(n):
-    i = np.arange(n) + 0.5
-    phi = np.arccos(1.0 - 2.0 * i / n)
-    th = np.pi * (1.0 + 5.0 ** 0.5) * i
-    return np.stack([np.sin(phi)*np.cos(th), np.sin(phi)*np.sin(th), np.cos(phi)], 1).astype(np.float32)
 
 # ============================================================================
 # TRACKER LOOP -- coverage state + per-batch R_batch / map update.
@@ -266,7 +252,6 @@ def _tracker_loop_reference(
     q_scale_floor: float = 1e-5,
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6, use_gate=True, damp_below_l=2,
     use_coverage_mask=True,
-    n_grid_cov=768,
 ):
     import h5py
  
@@ -286,11 +271,7 @@ def _tracker_loop_reference(
     cov_scale_val = 1.0
     coverage_ready = False
     events_seen = 0
-
-    # frozen hard footprint (built during warmup, in the lab frame)
-    grid_np = _fibonacci_sphere_np(n_grid_cov)          # (G,3) constant
-    occ_np = np.zeros(n_grid_cov, dtype=np.float32)
-
+ 
     tracking_history = [(0.0, np.array(U_curr))]
  
     for batch_data in event_batches:
@@ -339,10 +320,6 @@ def _tracker_loop_reference(
         else:
             use_cov_flag = 0.0 
 
-        if not coverage_ready:
-            idx = np.argmax(q_lab_obs @ grid_np.T, axis=1)   # nearest cell per observed dir
-            occ_np[np.unique(idx)] = 1.0
-
         # Do not move U until the coverage map is representative. During warmup
         # vis==1 (full-sphere) OR the map is unrepresentative (panel ramp / mid-
         # stream resume); against cap-confined data that is a coverage-shaped
@@ -379,7 +356,6 @@ def _tracker_loop_reference(
         P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
             q_theo_sample_jax, w_l_j, I_weights_jax,
-            grid_np, occ_np,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
             current_q_scale,
             R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
@@ -494,7 +470,6 @@ def tracker(
     use_gate=False,
     damp_below_l=3,
     use_coverage_mask=True,
-    n_grid_cov=768,
 ):
     from subhkl.optimization import FindUB
 
@@ -607,7 +582,6 @@ def tracker(
         cos_gate, gate_temp, low_l_damp,
         use_gate, damp_below_l,
         use_coverage_mask,
-        n_grid_cov,
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
