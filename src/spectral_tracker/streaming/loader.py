@@ -101,12 +101,12 @@ def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, ta
         
         # 5. Fast JAX Convolution
         field = jax.scipy.signal.fftconvolve(events, kernel_jax, mode='same')
-        return field > threshold
+        return field > threshold, threshold
 
     # Skip FFT entirely if the panel is basically empty
-    detected_mask = jax.lax.cond(
+    detected_mask, applied_threshold = jax.lax.cond(
         lambda_bg < 1e-9,
-        lambda: jnp.ones((nx, ny), dtype=bool),
+        lambda: (jnp.ones((nx, ny), dtype=bool), jnp.zeros((), dtype=calc_dtype)),
         _compute_mask
     )
     
@@ -114,7 +114,7 @@ def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, ta
     event_detected = detected_mask[pr_safe, pc_safe]
     
     # Only retain if the event belonged to this bank AND passed threshold
-    return jnp.logical_and(event_detected, valid_mask)
+    return jnp.logical_and(event_detected, valid_mask), lambda_bg, applied_threshold
 
 
 class EventStreamSparsifier:
@@ -149,9 +149,20 @@ class EventStreamSparsifier:
                 det = Detector(det_config)
                 self.nx_ny[b_id] = (det.n, det.m)
                 
+        # Track tuning statistics
+        self.stats = {
+            "total_events_in": 0,
+            "total_events_out": 0,
+            "panels_processed": 0,
+            "lambdas": [],
+            "thresholds": []
+        }
+
     def filter_batch(self, banks, pr, pc):
         keep_mask = np.zeros(len(banks), dtype=bool)
         unique_banks = np.unique(banks)
+        
+        self.stats["total_events_in"] += len(banks)
         
         # Move batch data to device once
         banks_jax = jnp.asarray(banks)
@@ -168,7 +179,7 @@ class EventStreamSparsifier:
             valid_mask = (banks_jax == b_id)
             
             # Execute fully JIT-compiled pipeline natively on GPU
-            bank_keep_mask = _sparsify_bank_jax(
+            bank_keep_mask, lambda_bg, threshold = _sparsify_bank_jax(
                 pr_jax, pc_jax, valid_mask, 
                 nx, ny, self.kernel_jax, self.kernel_sq_sum, float(self.target_fp)
             )
@@ -176,7 +187,29 @@ class EventStreamSparsifier:
             # Combine back into the numpy keep_mask
             keep_mask |= np.asarray(bank_keep_mask)
             
+            # Update tuning statistics
+            self.stats["panels_processed"] += 1
+            self.stats["lambdas"].append(float(lambda_bg))
+            self.stats["thresholds"].append(float(threshold))
+            
+        self.stats["total_events_out"] += int(keep_mask.sum())
         return keep_mask
+
+    def get_statistics(self):
+        """Returns aggregated statistics useful for tuning the sparsifier parameters."""
+        l_arr = np.array(self.stats["lambdas"])
+        t_arr = np.array(self.stats["thresholds"])
+        
+        return {
+            "total_events_in": self.stats["total_events_in"],
+            "total_events_out": self.stats["total_events_out"],
+            "retention_fraction": self.stats["total_events_out"] / max(1, self.stats["total_events_in"]),
+            "panels_processed": self.stats["panels_processed"],
+            "lambda_bg_mean": float(np.mean(l_arr)) if len(l_arr) > 0 else 0.0,
+            "lambda_bg_max": float(np.max(l_arr)) if len(l_arr) > 0 else 0.0,
+            "threshold_mean": float(np.mean(t_arr)) if len(t_arr) > 0 else 0.0,
+            "threshold_max": float(np.max(t_arr)) if len(t_arr) > 0 else 0.0,
+        }
 
     def __call__(self, raw_stream, batch_size_events: int = 10000, min_batch_size: int = 1):
         """
