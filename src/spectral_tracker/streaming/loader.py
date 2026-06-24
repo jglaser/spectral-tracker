@@ -3,11 +3,11 @@ import numpy as np
 import re
 import multiprocessing
 import concurrent.futures
-import scipy.stats
 import jax
 import jax.numpy as jnp
 import jax.scipy.signal
 from functools import partial
+import tensorflow_probability.substrates.jax.distributions as tfd
 
 from subhkl.instrument.detector import Detector
 from subhkl.config import beamlines, reduction_settings
@@ -50,6 +50,7 @@ def _extract_raw_bank(args):
         pixel_c = local_id % det.m
         pixel_r = local_id // det.m
 
+    # Upgraded to int32 to prevent 1D flatten overflow on large (512x512) panels
     banks = np.full(len(absolute_time), bank_id, dtype=np.int32)
 
     return (
@@ -63,8 +64,8 @@ def _extract_raw_bank(args):
 @partial(jax.jit, static_argnames=["nx", "ny", "target_fp"])
 def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, target_fp):
     # 1. Project events to 2D field using flattened indices for JAX bincount
-    pr_safe = jnp.clip(pr, 0, nx - 1)
-    pc_safe = jnp.clip(pc, 0, ny - 1)
+    pr_safe = jnp.clip(pr, 0, nx - 1).astype(jnp.int32)
+    pc_safe = jnp.clip(pc, 0, ny - 1).astype(jnp.int32)
     idx = pr_safe * ny + pc_safe
 
     weights = jnp.where(valid_mask, 1.0, 0.0).astype(jnp.float32)
@@ -75,7 +76,7 @@ def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, ta
     lambda_bg = jnp.maximum(-jnp.log(p_zero + 1e-15), 1e-12)
 
     def _compute_mask():
-        # 3. Compute Campbell moments and exact Gamma threshold 
+        # 3. Compute Campbell moments and exact Gamma parameters 
         kappa_1 = lambda_bg * 1.0  
         kappa_2 = lambda_bg * kernel_sq_sum
         theta = kappa_2 / kappa_1
@@ -85,18 +86,10 @@ def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, ta
         percentile = 1.0 - (target_fp / batch_pixels)
         percentile = jnp.clip(percentile, 0.0, 1.0 - 1e-15)
         
-        # 4. Pure Callback for the analytical inverse CDF (gamma.ppf)
-        def _gamma_ppf(k_val, theta_val, p_val):
-            return np.array(
-                scipy.stats.gamma.ppf(float(p_val), a=float(k_val), scale=float(theta_val)), 
-                dtype=np.float32
-            )
-            
-        threshold = jax.pure_callback(
-            _gamma_ppf, 
-            jax.ShapeDtypeStruct((), jnp.float32), 
-            k, theta, percentile
-        )
+        # 4. Native XLA Gamma Inverse CDF (Eliminates host-device callback syncs)
+        # tfp Gamma parameters: concentration = shape (k), rate = 1/scale (1/theta)
+        gamma_dist = tfd.Gamma(concentration=k, rate=1.0 / theta)
+        threshold = gamma_dist.quantile(percentile)
         
         # 5. Fast JAX Convolution
         field = jax.scipy.signal.fftconvolve(events, kernel_jax, mode='same')
@@ -166,7 +159,7 @@ class EventStreamSparsifier:
             nx, ny = self.nx_ny[b_id]
             valid_mask = (banks_jax == b_id)
             
-            # Execute fully JIT-compiled pipeline
+            # Execute fully JIT-compiled pipeline natively on GPU
             bank_keep_mask = _sparsify_bank_jax(
                 pr_jax, pc_jax, valid_mask, 
                 nx, ny, self.kernel_jax, self.kernel_sq_sum, float(self.target_fp)

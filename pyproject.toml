@@ -8,6 +8,7 @@ dependencies = [
     "e3x",
     "jax>=0.9.1",
     "subhkl",
+    "tfp-nightly",
 ]
 
 [tool.uv.sources]
