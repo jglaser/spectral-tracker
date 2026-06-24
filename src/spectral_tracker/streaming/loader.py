@@ -50,13 +50,13 @@ def _extract_raw_bank(args):
         pixel_c = local_id % det.m
         pixel_r = local_id // det.m
 
-    banks = np.full(len(absolute_time), bank_id, dtype=np.int16)
+    banks = np.full(len(absolute_time), bank_id, dtype=np.int32)
 
     return (
         absolute_time,
         banks,
-        pixel_r.astype(np.int16),
-        pixel_c.astype(np.int16)
+        pixel_r.astype(np.int32),
+        pixel_c.astype(np.int32)
     )
 
 
