@@ -3,8 +3,11 @@ import numpy as np
 import re
 import multiprocessing
 import concurrent.futures
-from scipy.signal import fftconvolve
 import scipy.stats
+import jax
+import jax.numpy as jnp
+import jax.scipy.signal
+from functools import partial
 
 from subhkl.instrument.detector import Detector
 from subhkl.config import beamlines, reduction_settings
@@ -57,11 +60,67 @@ def _extract_raw_bank(args):
     )
 
 
+@partial(jax.jit, static_argnames=["nx", "ny", "target_fp"])
+def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, target_fp):
+    # 1. Project events to 2D field using flattened indices for JAX bincount
+    pr_safe = jnp.clip(pr, 0, nx - 1)
+    pc_safe = jnp.clip(pc, 0, ny - 1)
+    idx = pr_safe * ny + pc_safe
+
+    weights = jnp.where(valid_mask, 1.0, 0.0).astype(jnp.float32)
+    events = jnp.bincount(idx, weights=weights, length=nx * ny).reshape((nx, ny))
+
+    # 2. Sparse Regime Lambda Estimation (Immune to dense signal outliers)
+    p_zero = jnp.mean(events == 0)
+    lambda_bg = jnp.maximum(-jnp.log(p_zero + 1e-15), 1e-12)
+
+    def _compute_mask():
+        # 3. Compute Campbell moments and exact Gamma threshold 
+        kappa_1 = lambda_bg * 1.0  
+        kappa_2 = lambda_bg * kernel_sq_sum
+        theta = kappa_2 / kappa_1
+        k = kappa_1 / theta
+        
+        batch_pixels = nx * ny
+        percentile = 1.0 - (target_fp / batch_pixels)
+        percentile = jnp.clip(percentile, 0.0, 1.0 - 1e-15)
+        
+        # 4. Pure Callback for the analytical inverse CDF (gamma.ppf)
+        def _gamma_ppf(k_val, theta_val, p_val):
+            return np.array(
+                scipy.stats.gamma.ppf(float(p_val), a=float(k_val), scale=float(theta_val)), 
+                dtype=np.float32
+            )
+            
+        threshold = jax.pure_callback(
+            _gamma_ppf, 
+            jax.ShapeDtypeStruct((), jnp.float32), 
+            k, theta, percentile
+        )
+        
+        # 5. Fast JAX Convolution
+        field = jax.scipy.signal.fftconvolve(events, kernel_jax, mode='same')
+        return field > threshold
+
+    # Skip FFT entirely if the panel is basically empty
+    detected_mask = jax.lax.cond(
+        lambda_bg < 1e-9,
+        lambda: jnp.ones((nx, ny), dtype=bool),
+        _compute_mask
+    )
+    
+    # 6. Map back to 1D event stream
+    event_detected = detected_mask[pr_safe, pc_safe]
+    
+    # Only retain if the event belonged to this bank AND passed threshold
+    return jnp.logical_and(event_detected, valid_mask)
+
+
 class EventStreamSparsifier:
     """
     Applies non-linear outlier detection to raw pixel events prior to 3D mapping.
     Uses the analytical Campbell framework to isolate Bragg peaks from the noise field.
-    Dynamically estimates background rates to adapt to fluctuating streaming fluxes.
+    Accelerated end-to-end via JAX JIT compilation.
     """
     def __init__(self, instrument_name, target_fp=1.0, gamma=1.5, nu=1.5, rc=3.0):
         self.instrument_name = instrument_name
@@ -75,8 +134,11 @@ class EventStreamSparsifier:
         R = np.sqrt(R_sq)
         
         raw_kernel = (1.0 / (1.0 + (R_sq / gamma**2))**nu) * np.exp(-R / rc)
-        self.kernel = raw_kernel / np.sum(raw_kernel)
-        self.kernel_sq_sum = np.sum(self.kernel**2)
+        kernel_np = (raw_kernel / np.sum(raw_kernel)).astype(np.float32)
+        
+        # Move kernel to device memory once
+        self.kernel_jax = jax.device_put(kernel_np)
+        self.kernel_sq_sum = jnp.sum(self.kernel_jax**2)
         
         # Map out grid sizes for configured banks
         self.nx_ny = {}
@@ -90,6 +152,11 @@ class EventStreamSparsifier:
         keep_mask = np.zeros(len(banks), dtype=bool)
         unique_banks = np.unique(banks)
         
+        # Move batch data to device once
+        banks_jax = jnp.asarray(banks)
+        pr_jax = jnp.asarray(pr)
+        pc_jax = jnp.asarray(pc)
+        
         for b_id in unique_banks:
             b_mask = (banks == b_id)
             if b_id not in self.nx_ny:
@@ -97,42 +164,16 @@ class EventStreamSparsifier:
                 continue
             
             nx, ny = self.nx_ny[b_id]
-            pr_b = pr[b_mask]
-            pc_b = pc[b_mask]
-            if len(pr_b) == 0:
-                continue
-                
-            # 1. Project events to 2D field to analyze the raw pixel counts
-            events, _, _ = np.histogram2d(pr_b, pc_b, bins=(nx, ny), range=[[0, nx], [0, ny]])
+            valid_mask = (banks_jax == b_id)
             
-            # 2. Dynamically estimate the background Poisson rate (lambda) for this batch.
-            p_zero = np.mean(events == 0)
-
-            # Sparse Regime: Inverse probability of zero events. 
-            # (Bragg peaks slightly reduce p_zero, making this a safely conservative overestimate).
-            lambda_bg = -np.log(p_zero)
-
-            # 3. Compute Campbell moments and exact Gamma threshold for the current lambda
-            kappa_1 = lambda_bg * 1.0  
-            kappa_2 = lambda_bg * self.kernel_sq_sum
-            theta = kappa_2 / kappa_1
-            k = kappa_1 / theta
+            # Execute fully JIT-compiled pipeline
+            bank_keep_mask = _sparsify_bank_jax(
+                pr_jax, pc_jax, valid_mask, 
+                nx, ny, self.kernel_jax, self.kernel_sq_sum, float(self.target_fp)
+            )
             
-            batch_pixels = nx * ny
-            percentile = 1.0 - (self.target_fp / batch_pixels)
-            percentile = min(max(percentile, 0.0), 1.0 - 1e-15)
-            
-            threshold = scipy.stats.gamma.ppf(percentile, a=k, scale=theta)
-            
-            # 4. Convolve to get local field
-            field = fftconvolve(events, self.kernel, mode='same')
-            
-            # 5. Non-linear detection
-            detected_mask = field > threshold
-            
-            pr_safe = np.clip(pr_b, 0, nx - 1)
-            pc_safe = np.clip(pc_b, 0, ny - 1)
-            keep_mask[b_mask] = detected_mask[pr_safe, pc_safe]
+            # Combine back into the numpy keep_mask
+            keep_mask |= np.asarray(bank_keep_mask)
             
         return keep_mask
 
