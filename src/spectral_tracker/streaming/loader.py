@@ -61,10 +61,10 @@ class EventStreamSparsifier:
     """
     Applies non-linear outlier detection to raw pixel events prior to 3D mapping.
     Uses the analytical Campbell framework to isolate Bragg peaks from the noise field.
+    Dynamically estimates background rates to adapt to fluctuating streaming fluxes.
     """
-    def __init__(self, instrument_name, per_pixel_rate=5e-6, target_fp=1.0, gamma=1.5, nu=1.5, rc=3.0):
+    def __init__(self, instrument_name, target_fp=1.0, gamma=1.5, nu=1.5, rc=3.0):
         self.instrument_name = instrument_name
-        self.per_pixel_rate = per_pixel_rate
         self.target_fp = target_fp
         
         # Precompute the Tempered Stable (CGMY Proxy) spatial kernel
@@ -86,19 +86,9 @@ class EventStreamSparsifier:
                 det = Detector(det_config)
                 self.nx_ny[b_id] = (det.n, det.m)
                 
-    def filter_batch(self, banks, pr, pc, batch_size):
+    def filter_batch(self, banks, pr, pc):
         keep_mask = np.zeros(len(banks), dtype=bool)
         unique_banks = np.unique(banks)
-        
-        # Calculate dynamic lambda based on the event batch throughput
-        lambda_bg = self.per_pixel_rate * batch_size
-        if lambda_bg < 1e-9:
-            return np.ones(len(banks), dtype=bool)
-            
-        kappa_1 = lambda_bg * 1.0  
-        kappa_2 = lambda_bg * self.kernel_sq_sum
-        theta = kappa_2 / kappa_1
-        k = kappa_1 / theta
         
         for b_id in unique_banks:
             b_mask = (banks == b_id)
@@ -112,18 +102,32 @@ class EventStreamSparsifier:
             if len(pr_b) == 0:
                 continue
                 
+            # 1. Project events to 2D field to analyze the raw pixel counts
+            events, _, _ = np.histogram2d(pr_b, pc_b, bins=(nx, ny), range=[[0, nx], [0, ny]])
+            
+            # 2. Dynamically estimate the background Poisson rate (lambda) for this batch.
+            p_zero = np.mean(events == 0)
+
+            # Sparse Regime: Inverse probability of zero events. 
+            # (Bragg peaks slightly reduce p_zero, making this a safely conservative overestimate).
+            lambda_bg = -np.log(p_zero)
+
+            # 3. Compute Campbell moments and exact Gamma threshold for the current lambda
+            kappa_1 = lambda_bg * 1.0  
+            kappa_2 = lambda_bg * self.kernel_sq_sum
+            theta = kappa_2 / kappa_1
+            k = kappa_1 / theta
+            
             batch_pixels = nx * ny
             percentile = 1.0 - (self.target_fp / batch_pixels)
             percentile = min(max(percentile, 0.0), 1.0 - 1e-15)
             
-            # Map Moments to Gamma for closed-form thresholding
             threshold = scipy.stats.gamma.ppf(percentile, a=k, scale=theta)
             
-            # Project events to 2D field and convolve
-            events, _, _ = np.histogram2d(pr_b, pc_b, bins=(nx, ny), range=[[0, nx], [0, ny]])
+            # 4. Convolve to get local field
             field = fftconvolve(events, self.kernel, mode='same')
             
-            # Non-linear detection
+            # 5. Non-linear detection
             detected_mask = field > threshold
             
             pr_safe = np.clip(pr_b, 0, nx - 1)
@@ -284,12 +288,12 @@ class EventStreamLoader:
             
         return q_lab, q_sample.astype(np.float32), ki_sample.astype(np.float32), interpolated_angles.T.astype(np.float32), s_lab_dynamic
 
-    def get_batches(self, batch_size_events: int = 10000, min_batch_size: int = 1, use_sparsifier: bool = False, per_pixel_rate: float = 5e-6):
+    def get_batches(self, batch_size_events: int = 10000, min_batch_size: int = 1, use_sparsifier: bool = False):
         if self.total_events == 0:
             return
 
         if use_sparsifier:
-            sparsifier = EventStreamSparsifier(self.instrument_name, per_pixel_rate=per_pixel_rate)
+            sparsifier = EventStreamSparsifier(self.instrument_name)
         else:
             sparsifier = None
 
@@ -308,7 +312,7 @@ class EventStreamLoader:
             n_read = len(t_b)
 
             if sparsifier:
-                keep_mask = sparsifier.filter_batch(b_b, pr_b, pc_b, batch_size=n_read)
+                keep_mask = sparsifier.filter_batch(b_b, pr_b, pc_b)
                 pack_times.append(t_b[keep_mask])
                 pack_banks.append(b_b[keep_mask])
                 pack_pr.append(pr_b[keep_mask])

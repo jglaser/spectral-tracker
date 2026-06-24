@@ -119,17 +119,9 @@ class TestStreamingLoaderSparsification(unittest.TestCase):
             sample_offset=sample_offset,
         )
         
-        # The sparsifier expects `lambda_bg` to be proportional to per_pixel_rate * batch_size.
-        # Since we load all 22,000 events in one batch, the expected background lambda is 
-        # (20,000 bg events / 10,000 pixels) = 2.0 events/pixel.
-        # Therefore, per_pixel_rate = 2.0 / 22000.
-        target_lambda = self.num_bg / (self.nx * self.ny)
-        rate = target_lambda / self.total_events
-        
         batches_filtered = list(loader_sparsified.get_batches(
             batch_size_events=50000, 
             use_sparsifier=True, 
-            per_pixel_rate=rate
         ))
         
         total_filtered = sum(len(b[1]) for b in batches_filtered)
