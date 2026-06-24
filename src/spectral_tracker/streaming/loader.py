@@ -63,16 +63,19 @@ def _extract_raw_bank(args):
 
 @partial(jax.jit, static_argnames=["nx", "ny", "target_fp"])
 def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, target_fp):
+    # Unify all floating point ops to the kernel's dtype to satisfy TFP strictness
+    calc_dtype = kernel_sq_sum.dtype
+
     # 1. Project events to 2D field using flattened indices for JAX bincount
     pr_safe = jnp.clip(pr, 0, nx - 1).astype(jnp.int32)
     pc_safe = jnp.clip(pc, 0, ny - 1).astype(jnp.int32)
     idx = pr_safe * ny + pc_safe
 
-    weights = jnp.where(valid_mask, 1.0, 0.0).astype(jnp.float32)
+    weights = jnp.where(valid_mask, 1.0, 0.0).astype(calc_dtype)
     events = jnp.bincount(idx, weights=weights, length=nx * ny).reshape((nx, ny))
 
     # 2. Sparse Regime Lambda Estimation (Immune to dense signal outliers)
-    p_zero = jnp.mean(events == 0)
+    p_zero = jnp.mean(events == 0).astype(calc_dtype)
     lambda_bg = jnp.maximum(-jnp.log(p_zero + 1e-15), 1e-12)
 
     def _compute_mask():
@@ -87,9 +90,14 @@ def _sparsify_bank_jax(pr, pc, valid_mask, nx, ny, kernel_jax, kernel_sq_sum, ta
         percentile = jnp.clip(percentile, 0.0, 1.0 - 1e-15)
         
         # 4. Native XLA Gamma Inverse CDF (Eliminates host-device callback syncs)
+        # Ensure strict dtype matching for tfp
+        k_safe = jnp.asarray(k, dtype=calc_dtype)
+        theta_safe = jnp.asarray(theta, dtype=calc_dtype)
+        percentile_safe = jnp.asarray(percentile, dtype=calc_dtype)
+
         # tfp Gamma parameters: concentration = shape (k), rate = 1/scale (1/theta)
-        gamma_dist = tfd.Gamma(concentration=k, rate=1.0 / theta)
-        threshold = gamma_dist.quantile(percentile)
+        gamma_dist = tfd.Gamma(concentration=k_safe, rate=1.0 / theta_safe)
+        threshold = gamma_dist.quantile(percentile_safe)
         
         # 5. Fast JAX Convolution
         field = jax.scipy.signal.fftconvolve(events, kernel_jax, mode='same')
