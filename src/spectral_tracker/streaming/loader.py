@@ -178,6 +178,58 @@ class EventStreamSparsifier:
             
         return keep_mask
 
+    def __call__(self, raw_stream, batch_size_events: int = 10000, min_batch_size: int = 1):
+        """
+        Consumes a raw event stream generator and yields sparsified, repacked batches.
+        Allows the stream to be sliced (`islice`) before entering the sparsifier.
+        """
+        pack_times, pack_banks, pack_pr, pack_pc = [], [], [], []
+        packed_count = 0
+        last_end_idx = 0
+
+        for t_b, b_b, pr_b, pc_b, end_idx in raw_stream:
+            last_end_idx = end_idx
+            
+            keep_mask = self.filter_batch(b_b, pr_b, pc_b)
+            
+            pack_times.append(t_b[keep_mask])
+            pack_banks.append(b_b[keep_mask])
+            pack_pr.append(pr_b[keep_mask])
+            pack_pc.append(pc_b[keep_mask])
+            packed_count += keep_mask.sum()
+
+            # Emit new packed batches
+            while packed_count >= batch_size_events:
+                merged_t = np.concatenate(pack_times)
+                merged_b = np.concatenate(pack_banks)
+                merged_pr = np.concatenate(pack_pr)
+                merged_pc = np.concatenate(pack_pc)
+
+                yield (
+                    merged_t[:batch_size_events],
+                    merged_b[:batch_size_events],
+                    merged_pr[:batch_size_events],
+                    merged_pc[:batch_size_events],
+                    end_idx
+                )
+
+                # Keep the remainder
+                pack_times = [merged_t[batch_size_events:]]
+                pack_banks = [merged_b[batch_size_events:]]
+                pack_pr = [merged_pr[batch_size_events:]]
+                pack_pc = [merged_pc[batch_size_events:]]
+                packed_count = len(pack_times[0])
+
+        # Yield any remaining packed events that satisfy min_batch_size
+        if packed_count >= min_batch_size:
+            yield (
+                np.concatenate(pack_times),
+                np.concatenate(pack_banks),
+                np.concatenate(pack_pr),
+                np.concatenate(pack_pc),
+                last_end_idx
+            )
+
 
 class EventStreamLoader:
     def __init__(
@@ -330,76 +382,38 @@ class EventStreamLoader:
             
         return q_lab, q_sample.astype(np.float32), ki_sample.astype(np.float32), interpolated_angles.T.astype(np.float32), s_lab_dynamic
 
-    def get_batches(self, batch_size_events: int = 10000, min_batch_size: int = 1, use_sparsifier: bool = False):
+    def get_raw_batches(self, batch_size_events: int = 10000):
+        """Yields unprojected raw event batches: (times, banks, pr, pc, cumulative_count)."""
         if self.total_events == 0:
             return
 
+        for start_idx in range(0, self.total_events, batch_size_events):
+            end_idx = min(start_idx + batch_size_events, self.total_events)
+            yield (
+                self.all_times[start_idx:end_idx],
+                self.all_banks[start_idx:end_idx],
+                self.all_pixels_r[start_idx:end_idx],
+                self.all_pixels_c[start_idx:end_idx],
+                end_idx
+            )
+
+    def project_stream(self, raw_stream):
+        """Consumes a stream of raw batches and lazily executes 3D transformations."""
+        for t_b, b_b, pr_b, pc_b, end_idx in raw_stream:
+            if len(t_b) == 0:
+                continue
+            q_lab, q_sample, ki_sample, angles, s_lab = self._project_events(
+                t_b, b_b, pr_b, pc_b
+            )
+            yield (q_sample, t_b, b_b, pr_b, pc_b, angles, s_lab, ki_sample, end_idx)
+
+    def get_batches(self, batch_size_events: int = 10000, min_batch_size: int = 1, use_sparsifier: bool = False):
+        """Legacy helper integrating extraction, sparsification, and projection."""
+        raw_stream = self.get_raw_batches(batch_size_events=batch_size_events)
+        
         if use_sparsifier:
             sparsifier = EventStreamSparsifier(self.instrument_name)
+            filtered_stream = sparsifier(raw_stream, batch_size_events=batch_size_events, min_batch_size=min_batch_size)
+            return self.project_stream(filtered_stream)
         else:
-            sparsifier = None
-
-        pack_times, pack_banks, pack_pr, pack_pc = [], [], [], []
-        packed_count = 0
-        read_chunk_size = batch_size_events
-
-        for start_idx in range(0, self.total_events, read_chunk_size):
-            end_idx = min(start_idx + read_chunk_size, self.total_events)
-            
-            t_b = self.all_times[start_idx:end_idx]
-            b_b = self.all_banks[start_idx:end_idx]
-            pr_b = self.all_pixels_r[start_idx:end_idx]
-            pc_b = self.all_pixels_c[start_idx:end_idx]
-            
-            n_read = len(t_b)
-
-            if sparsifier:
-                keep_mask = sparsifier.filter_batch(b_b, pr_b, pc_b)
-                pack_times.append(t_b[keep_mask])
-                pack_banks.append(b_b[keep_mask])
-                pack_pr.append(pr_b[keep_mask])
-                pack_pc.append(pc_b[keep_mask])
-                packed_count += keep_mask.sum()
-            else:
-                pack_times.append(t_b)
-                pack_banks.append(b_b)
-                pack_pr.append(pr_b)
-                pack_pc.append(pc_b)
-                packed_count += n_read
-
-            # Emit new packed batches
-            while packed_count >= batch_size_events:
-                merged_t = np.concatenate(pack_times)
-                merged_b = np.concatenate(pack_banks)
-                merged_pr = np.concatenate(pack_pr)
-                merged_pc = np.concatenate(pack_pc)
-
-                yield_t = merged_t[:batch_size_events]
-                yield_b = merged_b[:batch_size_events]
-                yield_pr = merged_pr[:batch_size_events]
-                yield_pc = merged_pc[:batch_size_events]
-
-                # Project the surviving slice lazily
-                q_lab, q_sample, ki_sample, angles, s_lab = self._project_events(
-                    yield_t, yield_b, yield_pr, yield_pc
-                )
-                yield (q_sample, yield_t, yield_b, yield_pr, yield_pc, angles, s_lab, ki_sample, end_idx)
-
-                # Keep the remainder
-                pack_times = [merged_t[batch_size_events:]]
-                pack_banks = [merged_b[batch_size_events:]]
-                pack_pr = [merged_pr[batch_size_events:]]
-                pack_pc = [merged_pc[batch_size_events:]]
-                packed_count = len(pack_times[0])
-
-        # Yield any remaining packed events that satisfy min_batch_size
-        if packed_count >= min_batch_size:
-            yield_t = np.concatenate(pack_times)
-            yield_b = np.concatenate(pack_banks)
-            yield_pr = np.concatenate(pack_pr)
-            yield_pc = np.concatenate(pack_pc)
-            
-            q_lab, q_sample, ki_sample, angles, s_lab = self._project_events(
-                yield_t, yield_b, yield_pr, yield_pc
-            )
-            yield (q_sample, yield_t, yield_b, yield_pr, yield_pc, angles, s_lab, ki_sample, self.total_events)
+            return self.project_stream(raw_stream)
