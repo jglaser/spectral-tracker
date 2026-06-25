@@ -16,18 +16,17 @@ def skew_symmetric(v):
         [0.0, -v[2], v[1]],
         [v[2], 0.0, -v[0]],
         [-v[1], v[0], 0.0]
-    ])
-
+    ], dtype=v.dtype)
 
 def vector_to_rotation_matrix(omega):
     """ Maps a 3D Lie algebra tangent vector to a proper SO(3) matrix via Rodrigues' formula. """
     theta = jnp.linalg.norm(omega)
     def small_theta():
-        return jnp.eye(3) + skew_symmetric(omega)
+        return jnp.eye(3, dtype=omega.dtype) + skew_symmetric(omega)
     def large_theta():
         k = omega / theta
         K = skew_symmetric(k)
-        return jnp.eye(3) + jnp.sin(theta) * K + (1.0 - jnp.cos(theta)) * jnp.matmul(K, K)
+        return jnp.eye(3, dtype=omega.dtype) + jnp.sin(theta) * K + (1.0 - jnp.cos(theta)) * jnp.matmul(K, K)
     return jax.lax.cond(theta < 1e-5, small_theta, large_theta)
 
 def _sample_to_lab_matrix(axes, rep_ang, offsets):
@@ -56,6 +55,9 @@ def predict_all_shells_q_space(
     weight is the only quantity evaluated in the lab frame, via the constant
     per-batch rotation R_batch.
     """
+    # Add dtype enforcement to arrays initialized within the forward model
+    sh_dtype = omega.dtype
+
     R_perturb = vector_to_rotation_matrix(omega)
     U_curr = jnp.matmul(U_base, R_perturb)
 
@@ -69,7 +71,7 @@ def predict_all_shells_q_space(
     # --- Ewald window (frame-invariant dot product), unchanged ---
     Y_beam = e3x.so3.irreps.spherical_harmonics(
         ki_batch[0], max_degree=L_max, cartesian_order=False, normalization="orthonormal")
-    ewald_window = jnp.zeros(Y_sample.shape[0])
+    ewald_window = jnp.zeros(Y_sample.shape[0], dtype=sh_dtype)
     for l in range(L_max + 1):
         dim_l = 2 * l + 1
         start, end = l ** 2, (l + 1) ** 2
@@ -100,7 +102,7 @@ def predict_all_shells_q_space(
 
         A_sig = jnp.matmul(Y_l.T, Y_l * weight[:, None]) / total_window_mass
         A_sig = A_sig * (4.0 * jnp.pi / float(dim_l))
-        A_dev = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
+        A_dev = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l, dtype=sh_dtype)
 
         preds.append(z_1st)
         preds.append(A_dev.flatten())
@@ -120,8 +122,9 @@ def kalman_subspace_update(
 ):
     """Consumes precomputed WEIGHTED sufficient statistics (A_lab_all,
     Y_lab_all_sum) and an effective (gated) event count."""
-    omega_state = jnp.zeros(3)
-    P_state = P_prev + jnp.eye(3) * (process_q_scale * dt)
+    sh_dtype = P_prev.dtype
+    omega_state = jnp.zeros(3, dtype=sh_dtype)
+    P_state = P_prev + jnp.eye(3, dtype=sh_dtype) * (process_q_scale * dt)
 
     z_data_list, R_diag_list = [], []
     for l in range(1, L_max + 1):
@@ -129,7 +132,7 @@ def kalman_subspace_update(
         start, end = l ** 2, (l + 1) ** 2
 
         A_sample_norm = A_sample_all[start:end, start:end] * (4.0 * jnp.pi / float(dim_l))
-        A_sample_dev = A_sample_norm - jnp.eye(dim_l) / float(dim_l)
+        A_sample_dev = A_sample_norm - jnp.eye(dim_l, dtype=sh_dtype) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
         # Suppress the low shells where the cap / smooth background lives.
@@ -137,10 +140,10 @@ def kalman_subspace_update(
 
         z_1st_norm = Y_sample_all_sum[start:end] / num_events
         z_data_list.append(z_1st_norm)
-        R_diag_list.append(jnp.full(dim_l, sigma_l))
+        R_diag_list.append(jnp.full(dim_l, sigma_l, dtype=sh_dtype))
 
         z_data_list.append(A_sample_dev.flatten())
-        R_diag_list.append(jnp.full(dim_l * dim_l, sigma_l * meas_weight_2nd / float(dim_l)))
+        R_diag_list.append(jnp.full(dim_l * dim_l, sigma_l * meas_weight_2nd / float(dim_l), dtype=sh_dtype))
 
     z_data = jnp.concatenate(z_data_list)
     R_diag = jnp.concatenate(R_diag_list)
@@ -158,7 +161,7 @@ def kalman_subspace_update(
     R_eff_inv = 1.0 / (R_diag + ridge_inflation)
     Ht_Rinv = H_global.T * R_eff_inv[None, :]
 
-    P_inv = jnp.linalg.pinv(P_state + jnp.eye(3) * 1e-9)
+    P_inv = jnp.linalg.pinv(P_state + jnp.eye(3, dtype=sh_dtype) * 1e-9)
     information_matrix = P_inv + jnp.matmul(Ht_Rinv, H_global)
     K_gain = jnp.matmul(jnp.linalg.pinv(information_matrix), Ht_Rinv)
 
@@ -183,6 +186,8 @@ def process_chunk_field_kalman(
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
     use_gate=True, damp_below_l=2,
 ):
+    sh_dtype = q_batch.dtype
+
     # NOTE: q_batch is in the SAMPLE frame (loader output).
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
     total_rate = q_batch.shape[0] / dt_chunk
@@ -199,7 +204,7 @@ def process_chunk_field_kalman(
         nn_cos = jnp.max(q_batch @ q_pred, axis=1)
         w = jax.nn.sigmoid((nn_cos - cos_gate) / gate_temp)
     else:
-        w = jnp.ones(q_batch.shape[0])          # purely directional: every event, no selection
+        w = jnp.ones(q_batch.shape[0], dtype=sh_dtype)
 
     # WEIGHTED sufficient statistics (background suppressed in the moment itself).
     eff_count = jnp.maximum(jnp.sum(w), 1.0)
@@ -216,7 +221,7 @@ def process_chunk_field_kalman(
     )
 
     U_final = U_new if actual_events > 0 else U_base
-    P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3) * (current_q_scale * dt_chunk))
+    P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3, dtype=sh_dtype) * (current_q_scale * dt_chunk))
 
     # A MEANINGFUL signal/background readout: the fraction the gate accepted.
     accepted = float(jnp.sum(w))
@@ -251,8 +256,12 @@ def _tracker_loop_reference(
     q_scale_floor: float = 1e-5,
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6, use_gate=True, damp_below_l=2,
     use_coverage_mask=True,
+    sh_dtype=None,
 ):
     import h5py
+
+    if sh_dtype is None:
+        sh_dtype = jnp.result_type(float)
  
     # Fallback: read axes from the finder file if the caller did not pass them.
     if gonio_axes is None:
@@ -297,7 +306,7 @@ def _tracker_loop_reference(
  
         # ---- accumulate the lab-frame occupancy map (EMA) ----
         Y_cov_obs = np.asarray(e3x.so3.irreps.spherical_harmonics(
-            jnp.asarray(q_lab_obs, dtype=jnp.float32),
+            jnp.asarray(q_lab_obs, dtype=sh_dtype),
             max_degree=L_cov, cartesian_order=False, normalization="orthonormal"))
         batch_coeffs = Y_cov_obs.mean(axis=0)
         cov_coeffs_np = (1.0 - cov_ema_weight) * cov_coeffs_np + cov_ema_weight * batch_coeffs
@@ -335,18 +344,18 @@ def _tracker_loop_reference(
                                             "bg_rate": 0.0, "coverage_ready": False})
             continue
 
-        # ---- device transfers (all traced inputs, no recompile on value change) ----
-        q_batch = jax.device_put(q_batch_np)
+        # Enforce target dtype on device transfers
+        q_batch = jax.device_put(q_batch_np).astype(sh_dtype)
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
-        t_batch = jax.device_put(t_batch_np)
-        ki_batch = jax.device_put(ki_sample_np)
+        t_batch = jax.device_put(t_batch_np).astype(sh_dtype)
+        ki_batch = jax.device_put(ki_sample_np).astype(sh_dtype)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
  
-        R_batch = jnp.asarray(R_batch_np)
-        cov_coeffs = jnp.asarray(cov_coeffs_np)
-        cov_scale = jnp.asarray(np.float32(cov_scale_val))
-        use_coverage = jnp.asarray(np.float32(use_cov_flag))
- 
+        R_batch = jnp.asarray(R_batch_np, dtype=sh_dtype)
+        cov_coeffs = jnp.asarray(cov_coeffs_np, dtype=sh_dtype)
+        cov_scale = jnp.asarray(np.float32(cov_scale_val), dtype=sh_dtype)
+        use_coverage = jnp.asarray(np.float32(use_cov_flag), dtype=sh_dtype)
+
         # ---- annealing schedule (unchanged) ----
         progress_fraction = min(t_state / (5.0 * annealing_rate), 1.0)
         current_q_scale = process_q_scale_start * (process_q_scale_end / process_q_scale_start) ** progress_fraction
@@ -469,8 +478,12 @@ def tracker(
     use_gate=False,
     damp_below_l=3,
     use_coverage_mask=True,
+    sh_dtype=None,
 ):
     from subhkl.optimization import FindUB
+
+    if sh_dtype is None:
+        sh_dtype = jnp.result_type(float)
 
     print(f"[0/3] Preparing Monolithic Lie Algebra Tangent Workspace (SO(3) Dimension=3)...")
 
@@ -504,8 +517,8 @@ def tracker(
     res_mask = (q_mags_np < (1.0 / d_min)) & (q_mags_np > (1.0 / d_max))
 
     q_theo_cryst = q_theo_cryst[:, res_mask]
-    q_mags_jax = jnp.array(q_mags_np[res_mask])
-    q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]))
+    q_mags_jax = jnp.array(q_mags_np[res_mask], dtype=sh_dtype)
+    q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]), dtype=sh_dtype)
     num_peaks = float(q_theo_sample_jax.shape[1])
 
     M_peaks = q_mags_np[res_mask].shape[0]
@@ -552,20 +565,20 @@ def tracker(
         else:
             print("    Warning: Could not find Intensity (type J) or Amplitude (type F) column in MTZ. Defaulting to uniform.")
 
-    I_weights_jax = jax.device_put(I_weights)
+    I_weights_jax = jax.device_put(I_weights).astype(sh_dtype)
 
-    w_l_j = build_band_weights(
+    w_l_j = jnp.asarray(build_band_weights(
        q_mags_np[res_mask], wl_min_tracking, wl_max_tracking, L_max,
        spectrum=assumed_spectrum,
        lorentz=lorentz_correction,
-    )
+    ), dtype=sh_dtype)
 
     if U_init is not None:
-        U_curr = jnp.array(U_init)
+        U_curr = jnp.array(U_init, dtype=sh_dtype)
     else:
-        U_curr = jnp.eye(3)
+        U_curr = jnp.eye(3, dtype=sh_dtype)
 
-    P_spectral_full = jnp.eye(3) * prior_ridge
+    P_spectral_full = jnp.eye(3, dtype=sh_dtype) * prior_ridge
 
     print(f"\n[2/3] Executing Field Tracker Pipeline (3 Local Subspace Rotational Degrees Active)...")
 
@@ -581,6 +594,7 @@ def tracker(
         cos_gate, gate_temp, low_l_damp,
         use_gate, damp_below_l,
         use_coverage_mask,
+        sh_dtype=sh_dtype,
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
