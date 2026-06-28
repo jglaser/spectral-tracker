@@ -36,7 +36,11 @@ def _extract_raw_bank(args):
     counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
     absolute_time = np.repeat(event_time_zero, counts_per_pulse) + (event_time_offset * 1e-6)
 
-    det_config = beamlines[instrument_name][bank_str]
+    if bank_str in beamlines[instrument_name]:
+        det_config = beamlines[instrument_name][bank_str]
+    else:
+        return None
+
     det = Detector(det_config)
     settings = reduction_settings.get(instrument_name, {})
 
