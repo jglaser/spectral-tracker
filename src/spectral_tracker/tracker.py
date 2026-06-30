@@ -171,7 +171,23 @@ def kalman_subspace_update(
     P_new = 0.5 * (P_new + P_new.T)
 
     U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
-    return U_new, P_new, z_pred, z_data
+
+    # 1. Condition of the Information Matrix (Hessian / Stiffness)
+    info_eigvals = jnp.linalg.eigvalsh(information_matrix)
+
+    # 2. The raw Gradient pulling the state (before stiffness restricts it)
+    raw_gradient = jnp.matmul(Ht_Rinv, (z_data - z_pred))
+
+    diagnostics = {
+        "omega_step_deg": jnp.linalg.norm(omega_update) * (180.0 / jnp.pi),
+        "grad_norm": jnp.linalg.norm(raw_gradient),
+        "info_eigval_min": info_eigvals[0],
+        "info_eigval_max": info_eigvals[-1],
+        "z_data_norm": jnp.linalg.norm(z_data),
+        "z_pred_norm": jnp.linalg.norm(z_pred)
+    }
+
+    return U_new, P_new, z_pred, z_data, diagnostics
 
 
 # ----------------------------------------------------------------------------
@@ -212,7 +228,7 @@ def process_chunk_field_kalman(
     Y_sample_all_sum = jnp.sum(Y_w, axis=0)
     A_sample_all = jnp.matmul(Y_w.T, Y_events_sample) / eff_count   # sum_i w_i Y_i Y_i^T / sum_i w_i
 
-    U_new, P_new, z_pred, z_data = kalman_subspace_update(
+    U_new, P_new, z_pred, z_data, step_diags = kalman_subspace_update(
         P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
         w_l_j, ki_batch, U_base, current_q_scale, dt_chunk, ridge_inflation,
         meas_noise_1st, meas_weight_2nd, num_events, L_max, low_l_damp, damp_below_l,
@@ -223,6 +239,10 @@ def process_chunk_field_kalman(
     U_final = U_new if actual_events > 0 else U_base
     P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3, dtype=sh_dtype) * (current_q_scale * dt_chunk))
 
+    # Handle zero-event batches safely
+    if actual_events == 0:
+        step_diags = {k: 0.0 for k in step_diags.keys()}
+
     # A MEANINGFUL signal/background readout: the fraction the gate accepted.
     accepted = float(jnp.sum(w))
     sig_rate = (accepted / max(actual_events, 1)) * total_rate
@@ -231,7 +251,7 @@ def process_chunk_field_kalman(
     innovation = z_data - z_pred
     spectral_nll = 0.5 * jnp.sum(jnp.square(innovation))
 
-    return P_final, U_final, spectral_nll, sig_rate, bg_rate
+    return P_final, U_final, spectral_nll, sig_rate, bg_rate, step_diags
 
 
 # ============================================================================
@@ -361,7 +381,7 @@ def _tracker_loop_reference(
         current_q_scale = process_q_scale_start * (process_q_scale_end / process_q_scale_start) ** progress_fraction
         current_q_scale = max(current_q_scale, q_scale_floor)
 
-        P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
+        P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, step_diags = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
             q_theo_sample_jax, w_l_j, I_weights_jax,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
@@ -386,14 +406,26 @@ def _tracker_loop_reference(
         if streaming_callback is not None:
             new_events = {"banks": banks_np, "pixel_r": pr_np, "pixel_c": pc_np,
                           "angles": angles_np, "s_lab": slab_np}
+
+            metrics = {
+                "loss": float(spectral_nll),
+                "eigengap": norm_gap_metric,
+                "sig_rate": float(sig_rate),
+                "bg_rate": float(bg_rate),
+                "coverage_ready": coverage_ready,
+                "omega_step_deg": float(step_diags["omega_step_deg"]),
+                "grad_norm": float(step_diags["grad_norm"]),
+                "info_eigval_min": float(step_diags["info_eigval_min"]),
+                "info_eigval_max": float(step_diags["info_eigval_max"]),
+                "z_data_norm": float(step_diags["z_data_norm"]),
+                "z_pred_norm": float(step_diags["z_pred_norm"]),
+            }
             streaming_callback(
                 time=t_state, U_preds=np.expand_dims(U_best, axis=0),
                 losses=np.array([float(spectral_nll)]), best_idx=0,
                 neutron_count=cumulative_count, new_events=new_events,
-                metrics={"loss": float(spectral_nll), "eigengap": norm_gap_metric,
-                         "sig_rate": float(sig_rate), "bg_rate": float(bg_rate),
-                         "coverage_ready": coverage_ready})
- 
+                metrics=metrics)
+
     return tracking_history
 
 def build_band_weights(q_mags, wl_min, wl_max, L_max, spectrum=None, lorentz=True, n_quad=4096):
