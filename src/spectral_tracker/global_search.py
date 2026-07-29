@@ -208,13 +208,35 @@ def orientation_error(U_a, U_b, ops=None):
     return min(ang(np.asarray(U_a) @ M, U_b) for M in ops)
 
 
+def distinct_solutions(U_cand, scores, ops, min_sep_deg=2.0):
+    """Indices of the distinct orientations in a scored shortlist, best first.
+
+    A shortlist refined from neighbouring grid points collapses onto the same
+    few solutions, so the raw runner-up is usually a duplicate of the winner
+    and any winner/runner-up ratio reads 1.00 no matter how good the answer
+    is. Confidence has to compare the best solution against the best
+    DIFFERENT one, which means deduplicating modulo the reindexing group
+    first.
+    """
+    order = np.argsort(-np.asarray(scores))
+    keep = []
+    for i in order:
+        if all(orientation_error(U_cand[i], U_cand[j], ops) > min_sep_deg
+               for j in keep):
+            keep.append(int(i))
+    return keep
+
+
 def search(q_obs, ki_obs, B, wl_band, d_min=5.0, n_grid=200_000, tau_deg=1.0,
-           refine_top=200, rescore_tau=0.5, schedule=None, block=64):
+           refine_top=200, rescore_tau=0.5, schedule=None, block=64,
+           min_sep_deg=2.0):
     """Grid search, refine the shortlist, rank by rescore.
 
-    Returns a dict with the winning orientation, its score, the runner-up
-    score, and the separation ratio between them. The ratio is the confidence
-    readout: below ~1.1 the answer is not distinguishable from the null tail.
+    Returns the winning orientation plus a `separation`: its score divided by
+    the best score among candidates that are a genuinely DIFFERENT orientation
+    (see distinct_solutions). That ratio is the confidence readout -- near 1.0
+    the answer is not distinguishable from the null tail, and it is the thing
+    to watch when asking how few events an indexing solution needs.
     """
     from spectral_tracker.tracker import DEFAULT_REFINE_SCHEDULE
     schedule = schedule or DEFAULT_REFINE_SCHEDULE
@@ -231,10 +253,13 @@ def search(q_obs, ki_obs, B, wl_band, d_min=5.0, n_grid=200_000, tau_deg=1.0,
     U_ref = refine_candidates(q_obs, U_all[order], p_cry, q_mags, allowed,
                               schedule)
     sc2 = score_orientations(q_obs, U_ref, p_cry, allowed, rescore_tau, block)
-    rank = np.argsort(-sc2)
-    best, second = rank[0], rank[1]
-    return dict(U=U_ref[best], score=float(sc2[best]),
-                runner_up=float(sc2[second]),
-                separation=float(sc2[best] / max(sc2[second], 1e-12)),
+    ops = lattice_rotations(B)
+    keep = distinct_solutions(U_ref, sc2, ops, min_sep_deg)
+    best = keep[0]
+    second = keep[1] if len(keep) > 1 else None
+    runner = float(sc2[second]) if second is not None else 0.0
+    return dict(U=U_ref[best], score=float(sc2[best]), runner_up=runner,
+                separation=float(sc2[best] / max(runner, 1e-12)),
+                n_distinct=len(keep), distinct=keep,
                 candidates=U_ref, candidate_scores=sc2,
                 grid_scores=sc, grid_order=order, n_reflections=len(p_cry))
