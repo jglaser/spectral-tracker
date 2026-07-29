@@ -547,7 +547,18 @@ def correspondence_normal_equations(q_obs, p_pred, active, tau, sigma):
     inv2t2 = 1.0 / (0.5 * tau ** 2)
     # Inactive candidates are pushed to cos = -1 rather than masked after the
     # exponential, so the row maximum below is always a real candidate.
-    c = jnp.clip(jnp.matmul(q_obs, p_pred.T), -1.0, 1.0)  # (N, M) cosines
+    #
+    # PRECISION IS NOT OPTIONAL HERE. jax's default matmul precision resolves to
+    # bfloat16 on this GPU, giving max |d cos| = 6.7e-4 between unit vectors.
+    # The quantity being measured is 1 - cos(theta): 1.4e-5 at 0.3 deg, 1.4e-3
+    # at 3 deg. So the default error is 49x the signal at the accuracy this is
+    # meant to reach, and comparable to it even at the widest window; the
+    # weights are exp() of that difference times up to 2.6e4, so at tau = 0.5
+    # deg the default randomises them by e^17. It survived at all only because
+    # at d_min = 8 A the candidates are ~20 deg apart, so the assignment stays
+    # right even when the weights are noise.
+    c = jnp.clip(jnp.matmul(q_obs, p_pred.T, precision=jax.lax.Precision.HIGHEST),
+                 -1.0, 1.0)                               # (N, M) cosines
     c = jnp.where(active[None, :] > 0, c, -1.0)
     cmax = jnp.max(c, axis=1)                             # (N,)
     # Shift before exponentiating: 1/(0.5 tau^2) reaches ~1e5 at tau = 0.15 deg,
