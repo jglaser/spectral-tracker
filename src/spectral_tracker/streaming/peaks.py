@@ -32,6 +32,20 @@ wrong orientation gets to explain).
 
 Recall is deliberately low at the recommended settings. Global search does not
 need every reflection; it needs directions it can trust.
+
+HOW FEW EVENTS THIS NEEDS
+
+Running the whole chain -- events, peaks, 200k orientation grid, refine,
+rescore -- with no prior orientation at all, on CG4D_1808:
+
+    250,000 raw events (79 s of beam)    4.6 deg, 1.13x   not indexed
+    500,000 raw events (159 s)           0.68 deg, 1.80x  INDEXED
+      5,000,000 raw events (26 min)      0.71 deg, 1.84x  INDEXED
+    272,902,295 raw events (24 h)        0.74 deg, 1.89x  INDEXED
+
+So half a million events -- under three minutes of beam on this instrument --
+is enough to index from nothing, and the remaining 272 million buy 0.06 deg of
+accuracy and 0.09x of confidence.
 """
 from __future__ import annotations
 
@@ -64,6 +78,21 @@ class EventPeakFinder:
         the precision/recall knob and, unlike the sparsifier's `target_fp`, it
         has a usable range: on CG4D_1808 precision runs 28% at n_sigma=8 to 79%
         at n_sigma=12 with sigma=5.
+
+        The default of 6 is chosen for the event-starved end rather than the
+        best precision, because that is where the knob actually matters.
+        Separation of the global-search winner from the best different
+        solution, CG4D_1808:
+
+            raw events     n_sigma=5   n_sigma=6   n_sigma=8   n_sigma=12
+              250,000       1.13x(no)   too few     too few     too few
+              500,000       1.38x       1.80x       1.34x       too few
+            1,000,000       1.78x       1.65x       1.95x       too few
+            5,000,000       1.81x       1.84x       1.79x       1.75x
+          272,902,295         --          --          --        1.89x
+
+        Raise it when events are plentiful and precision is what you want;
+        lower it when they are not.
     min_separation
         Peaks closer than this (pixels) are merged by the maximum filter.
         Defaults to 1.5 * sigma.
@@ -72,7 +101,7 @@ class EventPeakFinder:
     """
 
     def __init__(self, instrument_name: str, sigma: float = 5.0,
-                 n_sigma: float = 12.0, min_separation: int | None = None,
+                 n_sigma: float = 6.0, min_separation: int | None = None,
                  max_peaks_per_bank: int = 200):
         self.instrument_name = instrument_name
         self.sigma = float(sigma)
