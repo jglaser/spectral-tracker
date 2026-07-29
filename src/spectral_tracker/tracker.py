@@ -277,6 +277,11 @@ def _tracker_loop_reference(
     cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6, use_gate=True, damp_below_l=2,
     use_coverage_mask=True,
     sh_dtype=None,
+    measurement="spectral", q_mags_jax=None,
+    wl_min_tracking=0.5, wl_max_tracking=12.0,
+    tau_deg_start=8.0, tau_deg_end=0.15, tau_anneal_batches=40,
+    sigma_deg=0.2, max_step_scale=0.5, p_floor_deg=0.05,
+    d_min_start=None, d_min_end=2.0, refine_schedule=None,
 ):
     import h5py
 
@@ -299,7 +304,9 @@ def _tracker_loop_reference(
     cov_scale_val = 1.0
     coverage_ready = False
     events_seen = 0
- 
+    n_batches = 0
+    stage, stage_batches = 0, 0
+
     tracking_history = [(0.0, np.array(U_curr))]
  
     for batch_data in event_batches:
@@ -311,7 +318,72 @@ def _tracker_loop_reference(
         t_state = float(t_batch_np[-1])
         events_seen += len(t_batch_np)   # NEW
 
- 
+        if measurement == "correspondence":
+            n_batches += 1
+            q_batch = jax.device_put(q_batch_np).astype(sh_dtype)
+            q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
+            ki_batch = jax.device_put(ki_sample_np).astype(sh_dtype)
+            ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
+            t_batch = jax.device_put(t_batch_np).astype(sh_dtype)
+
+            if refine_schedule:
+                # Hold each (resolution, window) pair for a fixed number of
+                # batches, then step to the next and stay on the last one.
+                # A continuous anneal fails here: at every intermediate setting
+                # the correspondences have to actually settle before the shell
+                # opens, and one Gauss-Newton step per batch is not enough.
+                while (stage < len(refine_schedule) - 1
+                       and stage_batches >= refine_schedule[stage][2]):
+                    stage += 1
+                    stage_batches = 0
+                stage_batches += 1
+                d_cur, tau_deg = refine_schedule[stage][0], refine_schedule[stage][1]
+            else:
+                # Continuous fallback. The window has to start above the seed
+                # misorientation or nothing is inside capture range and the step
+                # averages to zero, and end near the spot width or it keeps
+                # admitting neighbouring reflections. Measured to be worse than
+                # the staged schedule above on real data -- kept for tuning.
+                frac = min(n_batches / max(tau_anneal_batches, 1), 1.0)
+                tau_deg = tau_deg_start * (tau_deg_end / tau_deg_start) ** frac
+                d_cur = d_min_start * (d_min_end / d_min_start) ** frac
+            q_max = 1.0 / d_cur
+            progress_fraction = min(t_state / (5.0 * annealing_rate), 1.0)
+            current_q_scale = max(
+                process_q_scale_start
+                * (process_q_scale_end / process_q_scale_start) ** progress_fraction,
+                q_scale_floor)
+
+            P_spectral_full, U_curr, n_acc, step_diags = process_chunk_correspondence(
+                P_spectral_full, q_batch, ki_batch, t_batch,
+                q_theo_sample_jax, q_mags_jax, U_curr, current_q_scale,
+                wl_min_tracking, wl_max_tracking,
+                np.radians(tau_deg), np.radians(sigma_deg),
+                np.radians(max_step_scale * tau_deg), np.radians(p_floor_deg),
+                q_max)
+            U_curr.block_until_ready()
+            U_best = np.array(U_curr)
+            tracking_history.append((t_state, U_best))
+
+            if streaming_callback is not None:
+                metrics = {
+                    "loss": 0.0,
+                    "eigengap": float(jnp.trace(jnp.linalg.pinv(P_spectral_full))),
+                    "sig_rate": float(n_acc), "bg_rate": 0.0,
+                    "coverage_ready": True, "tau_deg": tau_deg, "d_min_cur": d_cur,
+                    "stage": stage,
+                    **{k: float(v) for k, v in step_diags.items()},
+                }
+                streaming_callback(
+                    time=t_state, U_preds=np.expand_dims(U_best, axis=0),
+                    losses=np.array([0.0]), best_idx=0,
+                    neutron_count=cumulative_count,
+                    new_events={"banks": banks_np, "pixel_r": pr_np, "pixel_c": pc_np,
+                                "angles": angles_np, "s_lab": slab_np},
+                    metrics=metrics)
+            continue
+
+
         # ---- build the per-batch sample->lab rotation (host-side) ----
         if has_gonio and angles_np is not None and np.size(angles_np) > 0:
             ang2d = np.atleast_2d(angles_np)                 # (N, num_axes)
@@ -428,6 +500,166 @@ def _tracker_loop_reference(
 
     return tracking_history
 
+# ----------------------------------------------------------------------------
+# Correspondence measurement.
+#
+# The spectral measurement above matches the degree <= L_max moments of the
+# event-direction distribution. Its angular resolution is ~180/L_max degrees,
+# and it only carries orientation information while the excited reflections are
+# few enough to make those moments anisotropic. Both conditions hold for the
+# 10 A cubic cell in tests/ (~150 reflections in band, 4.6 deg spot width) and
+# neither holds for a macromolecular cell: T4 lysozyme (61.5, 61.5, 95.9,
+# P3_221) excites ~10^4 reflections between 2.8 and 4.5 A, whose l <= 8 moments
+# are isotropic to ~0.1%, while the spots themselves are ~0.1 deg wide. Measured
+# on CG4D_1808: ||z_data - z_pred|| changes by +0.07% at 1 deg from the indexing
+# solution and is LOWER at 32 deg -- no usable gradient and a deeper false
+# minimum, which is what makes the tracker walk from 3 deg to 35 deg.
+#
+# The measurement below instead assigns each event to its nearest predicted
+# reflection and solves the resulting linear least-squares problem for the
+# sample-frame rotation vector. It has no intrinsic resolution limit and returns
+# a proper information matrix, so it drops straight into the Kalman state.
+# ----------------------------------------------------------------------------
+@partial(jax.jit, static_argnames=[])
+def correspondence_normal_equations(q_obs, p_pred, active, tau, sigma):
+    """Gauss-Newton normal equations for the sample-frame rotation vector.
+
+    For an event q matched to a prediction p, a small rotation exp([w]x) moves
+    p by w x p, so the tangential residual gives (w x p) = q - (q.p) p. Stacking
+    the per-event normal equations of that over all (event, candidate) pairs:
+
+        A = sum_ij w_ij (I - p_j p_j^T)      b = sum_ij w_ij (p_j x q_i)
+
+    and w_LS = A^-1 b. Both sums factor through per-candidate quantities, so the
+    cost is O(N*M) for the correlation and O(M) after -- never O(N*M*3).
+
+    Weights are a Gaussian in the match angle, normalised per event and then
+    scaled by that event's best weight. Per-event normalisation stops one event
+    with a very close candidate from dominating; the acceptance factor stops
+    background events -- which have no close candidate and would otherwise still
+    contribute unit weight spread over distant ones -- from contributing at all.
+
+    NOTE ON SIGN: q = k_f - k_i is a signed vector and `active` already keeps
+    only the scattering-side half of the candidates, so there is no antipodal
+    ambiguity to fold. Folding it (as a projective nearest-neighbour test would)
+    doubles the candidate density and halves the discriminant.
+    """
+    inv2t2 = 1.0 / (0.5 * tau ** 2)
+    # Inactive candidates are pushed to cos = -1 rather than masked after the
+    # exponential, so the row maximum below is always a real candidate.
+    c = jnp.clip(jnp.matmul(q_obs, p_pred.T), -1.0, 1.0)  # (N, M) cosines
+    c = jnp.where(active[None, :] > 0, c, -1.0)
+    cmax = jnp.max(c, axis=1)                             # (N,)
+    # Shift before exponentiating: 1/(0.5 tau^2) reaches ~1e5 at tau = 0.15 deg,
+    # so exp((c-1)*inv2t2) overflows to inf on the float32 round-off that puts c
+    # a part in 1e6 above 1, and inf/inf then poisons A and b with NaN.
+    w = jnp.exp((c - cmax[:, None]) * inv2t2) * active[None, :]
+    acc = jnp.exp((cmax - 1.0) * inv2t2)                  # per-event acceptance
+    w = w / (jnp.sum(w, axis=1, keepdims=True) + 1e-30) * acc[:, None]
+
+    W = jnp.sum(w, axis=0)                                # (M,) mass per candidate
+    v = jnp.matmul(w.T, q_obs)                            # (M, 3)
+
+    A = (jnp.eye(3, dtype=q_obs.dtype) * jnp.sum(W)
+         - jnp.einsum("m,mi,mj->ij", W, p_pred, p_pred))
+    b = jnp.sum(jnp.cross(p_pred, v), axis=0)
+    inv_var = 1.0 / (sigma ** 2)
+    return A * inv_var, b * inv_var, jnp.sum(acc)
+
+
+# Validated on CG4D_1808 (T4 lysozyme, P3_221, 61.5/61.5/95.9). Each entry is
+# (resolution limit in A, match window in deg, batches to hold it for).
+#
+# Both ends are pinned by measurement. The window cannot start wider than ~3 deg:
+# at 6 deg it drags an already-correct seed out to 5.3 deg, because once the
+# window is comparable with the spacing between candidates the weighted
+# assignment stops being dominated by the right one. The shell cannot start
+# coarser than ~8 A either: at 12 A only ~18 reflections are in band, too few to
+# constrain three angles against 1762 observed spots, and it biases a perfect
+# seed to 1.2 deg before the finer stages pull it back. Starting at 6 A instead
+# is worse still (13 deg from a perfect seed) -- ~315 candidates against the
+# same spots is already enough decoys to capture the fit.
+#
+# Together those bound the capture range at 2-3 deg, which is a property of the
+# measurement, not of the schedule: recovering from a worse seed needs a global
+# search, i.e. re-indexing.
+DEFAULT_REFINE_SCHEDULE = ((8.0, 3.0, 25), (8.0, 1.5, 25),
+                           (8.0, 0.8, 25), (6.0, 0.5, 25))
+
+
+def process_chunk_correspondence(
+    P_prev, q_batch, ki_batch, t_batch, q_theo_sample_jax, q_mags_jax,
+    U_base, current_q_scale, wl_min, wl_max, tau, sigma, max_step, p_floor,
+    q_max, min_accepted=8.0,
+):
+    """One Kalman step from the correspondence measurement.
+
+    The state is the sample-frame rotation vector, so the update is applied on
+    the LEFT (U <- exp([w]x) U). That differs from the spectral path, which
+    perturbs in the crystal frame; the two are exclusive.
+
+    Two details do all the work in making this stable on real data:
+
+    * The per-event measurement noise is max(sigma, tau), not sigma. While the
+      window is wide most assignments are wrong, so the batch deserves little
+      confidence; the resulting gain A/(A + P^-1) damps the step exactly the way
+      a Levenberg parameter would. Using the final sigma throughout instead
+      makes every batch look like an exact measurement, and the first coarse
+      batch then locks the state onto whatever the wrong assignments implied.
+    * P is floored at p_floor^2 each batch. Without it the information keeps
+      accumulating, the gain decays like 1/n_batches, and the estimate freezes
+      at the coarse-window answer instead of following tau down.
+    """
+    sh_dtype = q_batch.dtype
+    dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
+    eye = jnp.eye(3, dtype=sh_dtype)
+
+    p_pred = jnp.matmul(U_base, q_theo_sample_jax).T                  # (M, 3)
+    s0 = ki_batch[0] / (jnp.linalg.norm(ki_batch[0]) + 1e-30)
+
+    # Elastic condition: lambda = -2 (p_hat . s0) / |q|, and only the half with
+    # p_hat . s0 < 0 can scatter at all.
+    dot = jnp.matmul(p_pred, s0)
+    lam = -2.0 * dot / jnp.maximum(q_mags_jax, 1e-30)
+    # q_max walks the resolution limit inwards->outwards over the run. The match
+    # window only rejects background while it is well inside the mean spacing
+    # between candidates: at d_min = 5 A this cell puts ~670 reflections in band,
+    # i.e. 7.8 deg apart, so a 7.5 deg window accepts every background event and
+    # the least-squares solution just follows the densest part of the detector.
+    # Opening the shell gradually keeps tau/spacing small throughout.
+    active = ((dot < 0) & (lam > wl_min) & (lam < wl_max)
+              & (q_mags_jax <= q_max)).astype(sh_dtype)
+
+    sigma_eff = jnp.maximum(sigma, tau)
+    A, b, n_acc = correspondence_normal_equations(
+        q_batch, p_pred, active, tau, sigma_eff)
+
+    P_state = P_prev + eye * jnp.maximum(current_q_scale * dt_chunk, p_floor ** 2)
+    information_matrix = jnp.linalg.inv(P_state) + A
+    P_new = jnp.linalg.inv(information_matrix + eye * 1e-12)
+    P_new = 0.5 * (P_new + P_new.T)
+    omega = jnp.matmul(P_new, b)
+
+    # Trust region: the linearisation only holds while |w| stays inside the
+    # match window, and a batch that accepted almost nothing must not move U.
+    step = jnp.linalg.norm(omega)
+    omega = jnp.where(step > max_step, omega * (max_step / (step + 1e-30)), omega)
+    omega = jnp.where(jnp.isfinite(omega).all() & (n_acc > min_accepted),
+                      omega, jnp.zeros_like(omega))
+
+    U_new = jnp.matmul(vector_to_rotation_matrix(omega), U_base)
+
+    diagnostics = {
+        "omega_step_deg": jnp.linalg.norm(omega) * (180.0 / jnp.pi),
+        "grad_norm": jnp.linalg.norm(b),
+        "info_eigval_min": jnp.linalg.eigvalsh(information_matrix)[0],
+        "info_eigval_max": jnp.linalg.eigvalsh(information_matrix)[-1],
+        "n_active": jnp.sum(active),
+        "n_accepted": n_acc,
+    }
+    return P_new, U_new, n_acc, diagnostics
+
+
 def build_band_weights(q_mags, wl_min, wl_max, L_max, spectrum=None, lorentz=True, n_quad=4096):
     """
     Ewald band weights w_l_j of shape (L_max+1, M).
@@ -489,11 +721,26 @@ def tracker(
     process_q_scale_end: float = 1e-7,
     q_scale_floor: float = 1e-5,
     annealing_rate: float = 1.0,
-    h_max: int = 6,
+    h_max: int | None = None,
     d_min: float = 2.0,
     d_max: float = 8.0,
-    wl_min_tracking: float = 0.5,
-    wl_max_tracking: float = 12.0,
+    wl_min_tracking: float | None = None,
+    wl_max_tracking: float | None = None,
+    # "spectral" matches SH moments of the event-direction distribution; it is
+    # what tests/ exercises and is only informative when the number of excited
+    # reflections is small enough to keep those moments anisotropic (~10 A cell).
+    # "correspondence" assigns events to predicted reflections and is what a
+    # macromolecular cell needs -- see the block above
+    # correspondence_normal_equations for the measurement that shows why.
+    measurement: str = "spectral",
+    tau_deg_start: float = 8.0,
+    tau_deg_end: float = 0.15,
+    tau_anneal_batches: int = 40,
+    sigma_deg: float = 0.2,
+    max_step_scale: float = 0.5,
+    p_floor_deg: float = 0.05,
+    d_min_start: float | None = None,
+    refine_schedule=DEFAULT_REFINE_SCHEDULE,
     L_max: int = 8,
     prior_ridge: float = 0.15,
     meas_noise_1st: float = 0.5,
@@ -537,9 +784,35 @@ def tracker(
                 U_init = f[key][()]
                 break
 
+        # The band the instrument can actually excite. Tracking with a band far
+        # wider than the real one admits reflections that were never in the data
+        # -- for CG4D the file says [2.8, 4.5] A while the old defaults spanned
+        # [0.5, 12.0], roughly five times too wide in lambda.
+        if "instrument/wavelength" in f:
+            wl_file = np.ravel(f["instrument/wavelength"][()])
+            if wl_min_tracking is None:
+                wl_min_tracking = float(np.min(wl_file))
+            if wl_max_tracking is None:
+                wl_max_tracking = float(np.max(wl_file))
+    if wl_min_tracking is None:
+        wl_min_tracking = 0.5
+    if wl_max_tracking is None:
+        wl_max_tracking = 12.0
+    print(f"    tracking wavelength band: [{wl_min_tracking}, {wl_max_tracking}] A")
+
     B_mat = ub_helper.reciprocal_lattice_B()
-    h_vals = np.arange(-h_max, h_max + 1)
-    hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
+
+    # A single cubic |h| <= h_max box is only complete when every cell edge is
+    # shorter than h_max * d_min. |h_i| <= |a_i| / d_min is the exact bound, and
+    # for (61.5, 61.5, 95.9) at d_min = 2 A it is (31, 31, 48) -- the old
+    # default of 6 silently kept ~0.2% of the reflections, biased towards low l.
+    if h_max is None:
+        A_real = np.linalg.inv(B_mat).T
+        h_bounds = np.ceil(np.linalg.norm(A_real, axis=0) / d_min).astype(int)
+    else:
+        h_bounds = np.full(3, int(h_max))
+    print(f"    hkl enumeration bounds: {tuple(int(x) for x in h_bounds)}")
+    hc, kc, lc = np.meshgrid(*[np.arange(-b, b + 1) for b in h_bounds], indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
     theo_hkl = hkl_c[:, mask_hkl_c].astype(np.float32)
@@ -627,6 +900,14 @@ def tracker(
         use_gate, damp_below_l,
         use_coverage_mask,
         sh_dtype=sh_dtype,
+        measurement=measurement, q_mags_jax=q_mags_jax,
+        wl_min_tracking=wl_min_tracking, wl_max_tracking=wl_max_tracking,
+        tau_deg_start=tau_deg_start, tau_deg_end=tau_deg_end,
+        tau_anneal_batches=tau_anneal_batches,
+        sigma_deg=sigma_deg, max_step_scale=max_step_scale,
+        p_floor_deg=p_floor_deg,
+        d_min_start=(d_min_start if d_min_start is not None else d_min),
+        d_min_end=d_min, refine_schedule=refine_schedule,
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
